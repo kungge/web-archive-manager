@@ -5,6 +5,7 @@ import argparse
 import json
 import mimetypes
 import sqlite3
+import subprocess
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = PROJECT_ROOT / "web"
 DEFAULT_DB = PROJECT_ROOT / "data" / "catalog.sqlite"
 CATEGORIES = ["technology", "ai", "career-work", "finance-business", "life", "society-culture", "productivity-tools", "uncategorized"]
-API_VERSION = 2
+API_VERSION = 3
 
 
 def connect(database: Path) -> sqlite3.Connection:
@@ -35,8 +36,16 @@ class ArchiveRepository:
         self.database = database
         self.override_path = database.parent / "user-overrides.json"
         self.override_lock = threading.Lock()
+        self.archive_root = self.read_archive_root()
         self.ensure_classification_columns()
         self.apply_overrides()
+
+    def read_archive_root(self) -> Path:
+        with connect(self.database) as db:
+            row = db.execute("SELECT value FROM metadata WHERE key='source_path'").fetchone()
+        if not row:
+            raise ValueError("catalog metadata does not contain source_path")
+        return Path(row[0]).resolve()
 
     def ensure_classification_columns(self) -> None:
         with connect(self.database) as db:
@@ -182,6 +191,24 @@ class ArchiveRepository:
         result["tags"] = json.loads(result.pop("tags_json") or "[]")
         return result
 
+    def get_local_file(self, asset_id: str, html_only: bool = False) -> Path:
+        with connect(self.database) as db:
+            row = db.execute("SELECT original_path, extension FROM assets WHERE asset_id=?", (asset_id,)).fetchone()
+        if not row:
+            raise KeyError(asset_id)
+        path = Path(row[0]).resolve()
+        if self.archive_root != path and self.archive_root not in path.parents:
+            raise PermissionError("asset path is outside archive root")
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        if html_only and row[1].lower() not in {"html", "htm"}:
+            raise TypeError("only HTML files support safe preview")
+        return path
+
+
+def open_local_file(path: Path) -> None:
+    subprocess.Popen(["open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 
 class AppHandler(BaseHTTPRequestHandler):
     repository: ArchiveRepository
@@ -218,7 +245,27 @@ class AppHandler(BaseHTTPRequestHandler):
                 return self.json_response(self.repository.get_asset(parsed.path.rsplit("/", 1)[-1]))
             except KeyError:
                 return self.error_response(404, "asset not found")
+        if parsed.path.startswith("/preview/"):
+            return self.serve_archive_preview(parsed.path.rsplit("/", 1)[-1])
         self.serve_static(parsed.path)
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/api/assets/") or not parsed.path.endswith("/open"):
+            return self.error_response(404, "not found")
+        asset_id = parsed.path.split("/")[-2]
+        try:
+            path = self.repository.get_local_file(asset_id)
+            open_local_file(path)
+            self.json_response({"opened": True, "asset_id": asset_id})
+        except KeyError:
+            self.error_response(404, "asset not found")
+        except FileNotFoundError:
+            self.error_response(410, "local file no longer exists")
+        except PermissionError as exc:
+            self.error_response(403, str(exc))
+        except OSError as exc:
+            self.error_response(500, f"failed to open local file: {exc}")
 
     def do_PATCH(self) -> None:
         parsed = urlparse(self.path)
@@ -251,6 +298,36 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def serve_archive_preview(self, asset_id: str) -> None:
+        try:
+            path = self.repository.get_local_file(asset_id, html_only=True)
+        except KeyError:
+            return self.error_response(404, "asset not found")
+        except FileNotFoundError:
+            return self.error_response(410, "local file no longer exists")
+        except PermissionError as exc:
+            return self.error_response(403, str(exc))
+        except TypeError as exc:
+            return self.error_response(415, str(exc))
+        size = path.stat().st_size
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Security-Policy", "sandbox; default-src 'none'; img-src data: blob:; style-src 'unsafe-inline' data:; font-src data:; media-src data: blob:")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            with path.open("rb") as stream:
+                while True:
+                    block = stream.read(1024 * 1024)
+                    if not block:
+                        break
+                    self.wfile.write(block)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 def main() -> int:

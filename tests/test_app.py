@@ -1,9 +1,13 @@
 import unittest
 import tempfile
 import shutil
+import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
-from app import ArchiveRepository, CATEGORIES, API_VERSION
+from app import ArchiveRepository, AppHandler, CATEGORIES, API_VERSION, ThreadingHTTPServer
 from scripts.classify_catalog import score_asset
 
 
@@ -61,6 +65,38 @@ class RepositoryTest(unittest.TestCase):
             self.assertEqual(restored["personal_note"], "稍后整理成知识笔记")
             favorite_results = ArchiveRepository(database).search(state_filter="favorite", limit=10)
             self.assertTrue(any(item["asset_id"] == asset["asset_id"] for item in favorite_results["items"]))
+
+    def test_local_file_is_restricted_to_archive_root(self):
+        repository = ArchiveRepository(self.database)
+        html_asset = repository.search(asset_type="web-html", limit=1)["items"][0]
+        self.assertTrue(repository.get_local_file(html_asset["asset_id"], html_only=True).is_file())
+        mhtml_asset = repository.search(asset_type="web-mhtml", limit=1)["items"][0]
+        with self.assertRaises(TypeError):
+            repository.get_local_file(mhtml_asset["asset_id"], html_only=True)
+
+    def test_preview_headers_and_system_open_endpoint(self):
+        repository = ArchiveRepository(self.database)
+        html_asset = repository.search(asset_type="web-html", limit=1)["items"][0]
+        AppHandler.repository = repository
+        server = ThreadingHTTPServer(("127.0.0.1", 0), AppHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            with urllib.request.urlopen(f"{base}/preview/{html_asset['asset_id']}") as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn("sandbox", response.headers["Content-Security-Policy"])
+                self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+                response.read(32)
+            request = urllib.request.Request(f"{base}/api/assets/{html_asset['asset_id']}/open", method="POST", data=b"")
+            with patch("app.open_local_file") as mocked_open:
+                with urllib.request.urlopen(request) as response:
+                    self.assertEqual(response.status, 200)
+                mocked_open.assert_called_once()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
 
 class ClassifierTest(unittest.TestCase):
