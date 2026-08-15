@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Local web UI for browsing and classifying archived webpages."""
+
+import argparse
+import json
+import mimetypes
+import sqlite3
+import threading
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+STATIC_ROOT = PROJECT_ROOT / "web"
+DEFAULT_DB = PROJECT_ROOT / "data" / "catalog.sqlite"
+CATEGORIES = ["technology", "ai", "career-work", "finance-business", "life", "society-culture", "productivity-tools", "uncategorized"]
+
+
+def connect(database: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(str(database), timeout=10)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def normalize_query(value: str) -> str:
+    return '"' + value.replace('"', '""').strip() + '"'
+
+
+class ArchiveRepository:
+    def __init__(self, database: Path) -> None:
+        self.database = database
+        self.override_path = database.parent / "user-overrides.json"
+        self.override_lock = threading.Lock()
+        self.apply_overrides()
+
+    def read_overrides(self) -> Dict[str, object]:
+        if not self.override_path.is_file():
+            return {}
+        try:
+            return json.loads(self.override_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def apply_overrides(self) -> None:
+        overrides = self.read_overrides()
+        if not overrides:
+            return
+        with connect(self.database) as db:
+            for asset_id, value in overrides.items():
+                category = value.get("primary_category")
+                tags = value.get("tags", [])
+                if category in CATEGORIES:
+                    db.execute("UPDATE assets SET primary_category=?, tags_json=? WHERE asset_id=?", (category, json.dumps(tags, ensure_ascii=False), asset_id))
+            db.commit()
+
+    def write_override(self, asset_id: str, category: str, tags: List[str]) -> None:
+        with self.override_lock:
+            overrides = self.read_overrides()
+            overrides[asset_id] = {"primary_category": category, "tags": tags}
+            temp = self.override_path.with_suffix(".tmp")
+            temp.write_text(json.dumps(overrides, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp.replace(self.override_path)
+
+    def stats(self) -> Dict[str, object]:
+        with connect(self.database) as db:
+            total = db.execute("SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store'").fetchone()[0]
+            ignored = db.execute("SELECT COUNT(*) FROM assets WHERE file_name = '.DS_Store'").fetchone()[0]
+            indexed = db.execute("SELECT COUNT(*) FROM contents WHERE extraction_status='success'").fetchone()[0]
+            categories = {row[0]: row[1] for row in db.execute("SELECT primary_category, COUNT(*) FROM assets WHERE file_name != '.DS_Store' GROUP BY primary_category")}
+            types = {row[0]: row[1] for row in db.execute("SELECT asset_type, COUNT(*) FROM assets WHERE file_name != '.DS_Store' GROUP BY asset_type")}
+        return {"total": total, "ignored": ignored, "indexed": indexed, "categories": categories, "types": types}
+
+    def search(self, query: str = "", category: str = "", asset_type: str = "", page: int = 1, limit: int = 30) -> Dict[str, object]:
+        page, limit = max(page, 1), max(1, min(limit, 100))
+        params: List[object] = []
+        filters = ["a.file_name != '.DS_Store'"]
+        if query.strip():
+            source = "contents_fts JOIN assets a USING(asset_id)"
+            filters.append("contents_fts MATCH ?")
+            params.append(normalize_query(query))
+            rank = "bm25(contents_fts, 0.0, 4.0, 1.0)"
+            snippet = "snippet(contents_fts, 2, '<mark>', '</mark>', '…', 30)"
+        else:
+            source = "assets a LEFT JOIN contents c USING(asset_id)"
+            rank = "0"
+            snippet = "substr(COALESCE(c.body_text,''),1,260)"
+        if category:
+            filters.append("a.primary_category = ?")
+            params.append(category)
+        if asset_type:
+            filters.append("a.asset_type = ?")
+            params.append(asset_type)
+        where = " WHERE " + " AND ".join(filters) if filters else ""
+        with connect(self.database) as db:
+            total = db.execute(f"SELECT COUNT(*) FROM {source}{where}", params).fetchone()[0]
+            rows = db.execute(f"""
+                SELECT a.asset_id, a.title_clean, a.primary_category, a.asset_type,
+                       a.source_domain, a.source_url, a.saved_at, a.original_path,
+                       a.size_bytes, a.tags_json, {snippet} AS excerpt, {rank} AS rank
+                FROM {source}{where}
+                ORDER BY rank, a.saved_at DESC LIMIT ? OFFSET ?
+            """, params + [limit, (page - 1) * limit]).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["tags"] = json.loads(item.pop("tags_json") or "[]")
+            item.pop("rank", None)
+            items.append(item)
+        return {"items": items, "total": total, "page": page, "limit": limit, "pages": max(1, (total + limit - 1) // limit)}
+
+    def update_asset(self, asset_id: str, category: str, tags: Optional[List[str]]) -> Dict[str, object]:
+        if category not in CATEGORIES:
+            raise ValueError("unknown category")
+        normalized_tags = sorted({tag.strip() for tag in (tags or []) if tag.strip()})
+        with connect(self.database) as db:
+            if not db.execute("SELECT 1 FROM assets WHERE asset_id=?", (asset_id,)).fetchone():
+                raise KeyError(asset_id)
+            db.execute("UPDATE assets SET primary_category=?, tags_json=? WHERE asset_id=?", (category, json.dumps(normalized_tags, ensure_ascii=False), asset_id))
+            db.commit()
+        self.write_override(asset_id, category, normalized_tags)
+        return {"asset_id": asset_id, "primary_category": category, "tags": normalized_tags}
+
+    def get_asset(self, asset_id: str) -> Dict[str, object]:
+        with connect(self.database) as db:
+            row = db.execute("SELECT a.*, COALESCE(c.body_text,'') AS body_text FROM assets a LEFT JOIN contents c USING(asset_id) WHERE a.asset_id=?", (asset_id,)).fetchone()
+        if not row:
+            raise KeyError(asset_id)
+        result = dict(row)
+        result["tags"] = json.loads(result.pop("tags_json") or "[]")
+        return result
+
+
+class AppHandler(BaseHTTPRequestHandler):
+    repository: ArchiveRepository
+
+    def json_response(self, value: object, status: int = 200) -> None:
+        payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def error_response(self, status: int, message: str) -> None:
+        self.json_response({"error": message}, status)
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/stats":
+            return self.json_response(self.repository.stats())
+        if parsed.path == "/api/search":
+            params = parse_qs(parsed.query)
+            try:
+                return self.json_response(self.repository.search(
+                    query=params.get("q", [""])[0], category=params.get("category", [""])[0],
+                    asset_type=params.get("type", [""])[0], page=int(params.get("page", ["1"])[0]),
+                    limit=int(params.get("limit", ["30"])[0])))
+            except (ValueError, sqlite3.Error) as exc:
+                return self.error_response(400, str(exc))
+        if parsed.path.startswith("/api/assets/"):
+            try:
+                return self.json_response(self.repository.get_asset(parsed.path.rsplit("/", 1)[-1]))
+            except KeyError:
+                return self.error_response(404, "asset not found")
+        self.serve_static(parsed.path)
+
+    def do_PATCH(self) -> None:
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/api/assets/"):
+            return self.error_response(404, "not found")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            result = self.repository.update_asset(parsed.path.rsplit("/", 1)[-1], payload.get("primary_category", ""), payload.get("tags", []))
+            self.json_response(result)
+        except KeyError:
+            self.error_response(404, "asset not found")
+        except (ValueError, json.JSONDecodeError) as exc:
+            self.error_response(400, str(exc))
+
+    def serve_static(self, request_path: str) -> None:
+        relative = "index.html" if request_path == "/" else request_path.lstrip("/")
+        target = (STATIC_ROOT / relative).resolve()
+        if STATIC_ROOT.resolve() not in target.parents or not target.is_file():
+            return self.error_response(404, "not found")
+        payload = target.read_bytes()
+        content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        if content_type.startswith("text/") or content_type == "application/javascript":
+            content_type += "; charset=utf-8"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--database", type=Path, default=DEFAULT_DB)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    args = parser.parse_args()
+    if not args.database.is_file():
+        raise SystemExit(f"database not found: {args.database}")
+    AppHandler.repository = ArchiveRepository(args.database.resolve())
+    server = ThreadingHTTPServer((args.host, args.port), AppHandler)
+    print(f"Web Archive Manager: http://{args.host}:{args.port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
