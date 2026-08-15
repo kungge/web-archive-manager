@@ -13,12 +13,14 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
+from scripts.incremental_scan import synchronize
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = PROJECT_ROOT / "web"
 DEFAULT_DB = PROJECT_ROOT / "data" / "catalog.sqlite"
 CATEGORIES = ["technology", "ai", "career-work", "finance-business", "life", "society-culture", "productivity-tools", "uncategorized"]
-API_VERSION = 5
+API_VERSION = 6
 SORT_OPTIONS = {
     "saved_desc": "a.saved_at DESC, a.asset_id",
     "saved_asc": "a.saved_at ASC, a.asset_id",
@@ -42,6 +44,7 @@ class ArchiveRepository:
         self.database = database
         self.override_path = database.parent / "user-overrides.json"
         self.override_lock = threading.Lock()
+        self.scan_lock = threading.Lock()
         self.archive_root = self.read_archive_root()
         self.ensure_classification_columns()
         self.apply_overrides()
@@ -123,12 +126,19 @@ class ArchiveRepository:
                 WHERE file_name != '.DS_Store' AND {active} AND source_domain IS NOT NULL AND source_domain != ''
                 GROUP BY source_domain ORDER BY COUNT(*) DESC, source_domain LIMIT 30
             """)]
-        return {"api_version": API_VERSION, "total": total, "ignored": ignored, "missing": missing, "indexed": indexed, "review": review, "favorites": favorites, "read": read, "categories": categories, "types": types, "domains": domains}
+            duplicate_assets = db.execute(f"SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND {active} AND duplicate_group IS NOT NULL").fetchone()[0]
+            duplicate_groups = db.execute(f"SELECT COUNT(DISTINCT duplicate_group) FROM assets WHERE file_name != '.DS_Store' AND {active} AND duplicate_group IS NOT NULL").fetchone()[0]
+            parse_errors = db.execute(f"SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND {active} AND parse_status='error'").fetchone()[0]
+            extraction_errors = db.execute(f"SELECT COUNT(*) FROM contents c JOIN assets a USING(asset_id) WHERE a.file_name != '.DS_Store' AND {active} AND c.extraction_status='error'").fetchone()[0]
+        maintenance = {"duplicate_assets": duplicate_assets, "duplicate_groups": duplicate_groups, "parse_errors": parse_errors, "extraction_errors": extraction_errors, "missing": missing}
+        return {"api_version": API_VERSION, "total": total, "ignored": ignored, "missing": missing, "indexed": indexed, "review": review, "favorites": favorites, "read": read, "categories": categories, "types": types, "domains": domains, "maintenance": maintenance}
 
-    def search(self, query: str = "", category: str = "", asset_type: str = "", state_filter: str = "", review: bool = False, page: int = 1, limit: int = 30, domain: str = "", date_from: str = "", date_to: str = "", sort: str = "saved_desc") -> Dict[str, object]:
+    def search(self, query: str = "", category: str = "", asset_type: str = "", state_filter: str = "", review: bool = False, page: int = 1, limit: int = 30, domain: str = "", date_from: str = "", date_to: str = "", sort: str = "saved_desc", issue: str = "") -> Dict[str, object]:
         page, limit = max(page, 1), max(1, min(limit, 100))
         if sort not in SORT_OPTIONS and sort != "relevance":
             raise ValueError("unknown sort option")
+        if issue not in {"", "duplicate", "parse_error", "extraction_error", "missing"}:
+            raise ValueError("unknown maintenance filter")
         for value in (date_from, date_to):
             if value:
                 try:
@@ -138,7 +148,7 @@ class ArchiveRepository:
         if date_from and date_to and date_from > date_to:
             raise ValueError("start date must not be later than end date")
         params: List[object] = []
-        filters = ["a.file_name != '.DS_Store'", "a.file_status = 'active'"]
+        filters = ["a.file_name != '.DS_Store'", "a.file_status = 'missing'" if issue == "missing" else "a.file_status = 'active'"]
         if query.strip():
             source = "contents_fts JOIN assets a USING(asset_id)"
             filters.append("contents_fts MATCH ?")
@@ -166,6 +176,12 @@ class ArchiveRepository:
             params.append(date_to)
         if review:
             filters.append("a.classification_source = 'auto-v2'")
+        if issue == "duplicate":
+            filters.append("a.duplicate_group IS NOT NULL")
+        elif issue == "parse_error":
+            filters.append("a.parse_status = 'error'")
+        elif issue == "extraction_error":
+            filters.append("EXISTS (SELECT 1 FROM contents issue_content WHERE issue_content.asset_id=a.asset_id AND issue_content.extraction_status='error')")
         if state_filter == "favorite":
             filters.append("a.is_favorite = 1")
         elif state_filter in {"read", "unread"}:
@@ -181,6 +197,9 @@ class ArchiveRepository:
                        a.size_bytes, a.tags_json, a.classification_source,
                        a.classification_confidence, a.classification_reason,
                        a.is_favorite, a.read_status, a.personal_note,
+                       a.file_status, a.duplicate_group, a.parse_status,
+                       a.error_message, (SELECT extraction_status FROM contents issue_status WHERE issue_status.asset_id=a.asset_id) AS extraction_status,
+                       (SELECT error_message FROM contents issue_status WHERE issue_status.asset_id=a.asset_id) AS extraction_error,
                        {snippet} AS excerpt, {rank} AS rank
                 FROM {source}{where}
                 ORDER BY {order_by} LIMIT ? OFFSET ?
@@ -192,6 +211,16 @@ class ArchiveRepository:
             item.pop("rank", None)
             items.append(item)
         return {"items": items, "total": total, "page": page, "limit": limit, "pages": max(1, (total + limit - 1) // limit)}
+
+    def run_incremental_scan(self) -> Dict[str, object]:
+        if not self.scan_lock.acquire(blocking=False):
+            raise RuntimeError("incremental scan is already running")
+        try:
+            result = synchronize(self.archive_root, self.database)
+            self.apply_overrides()
+            return result
+        finally:
+            self.scan_lock.release()
 
     def update_asset(self, asset_id: str, category: Optional[str], tags: Optional[List[str]], is_favorite: Optional[bool] = None, read_status: Optional[str] = None, personal_note: Optional[str] = None) -> Dict[str, object]:
         with connect(self.database) as db:
@@ -219,7 +248,11 @@ class ArchiveRepository:
 
     def get_asset(self, asset_id: str) -> Dict[str, object]:
         with connect(self.database) as db:
-            row = db.execute("SELECT a.*, COALESCE(c.body_text,'') AS body_text FROM assets a LEFT JOIN contents c USING(asset_id) WHERE a.asset_id=?", (asset_id,)).fetchone()
+            row = db.execute("""
+                SELECT a.*, COALESCE(c.body_text,'') AS body_text,
+                       c.extraction_status, c.error_message AS extraction_error
+                FROM assets a LEFT JOIN contents c USING(asset_id) WHERE a.asset_id=?
+            """, (asset_id,)).fetchone()
         if not row:
             raise KeyError(asset_id)
         result = dict(row)
@@ -273,6 +306,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     state_filter=params.get("state", [""])[0],
                     domain=params.get("domain", [""])[0], date_from=params.get("from", [""])[0],
                     date_to=params.get("to", [""])[0], sort=params.get("sort", ["saved_desc"])[0],
+                    issue=params.get("issue", [""])[0],
                     page=int(params.get("page", ["1"])[0]),
                     limit=int(params.get("limit", ["30"])[0])))
             except (ValueError, sqlite3.Error) as exc:
@@ -288,6 +322,13 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/maintenance/scan":
+            try:
+                return self.json_response(self.repository.run_incremental_scan())
+            except RuntimeError as exc:
+                return self.error_response(409, str(exc))
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                return self.error_response(500, str(exc))
         if not parsed.path.startswith("/api/assets/") or not parsed.path.endswith("/open"):
             return self.error_response(404, "not found")
         asset_id = parsed.path.split("/")[-2]

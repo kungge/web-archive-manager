@@ -60,6 +60,47 @@ class RepositoryTest(unittest.TestCase):
             repository.search(date_from="2026-08-16", date_to="2026-08-15")
         with self.assertRaises(ValueError):
             repository.search(sort="drop-table")
+        with self.assertRaises(ValueError):
+            repository.search(issue="unknown")
+
+    def test_maintenance_counts_and_filters(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "catalog.sqlite"
+            shutil.copy2(self.database, database)
+            repository = ArchiveRepository(database)
+            assets = repository.search(limit=4)["items"]
+            with sqlite3.connect(database) as db:
+                db.execute("UPDATE assets SET duplicate_group='test-group' WHERE asset_id IN (?,?)", (assets[0]["asset_id"], assets[1]["asset_id"]))
+                db.execute("UPDATE assets SET parse_status='error', error_message='test parse error' WHERE asset_id=?", (assets[2]["asset_id"],))
+                db.execute("UPDATE contents SET extraction_status='error', error_message='test extraction error' WHERE asset_id=?", (assets[3]["asset_id"],))
+                db.execute("UPDATE assets SET file_status='missing' WHERE asset_id=?", (assets[0]["asset_id"],))
+                db.commit()
+            stats = repository.stats()["maintenance"]
+            self.assertEqual(stats["duplicate_assets"], 1)
+            self.assertEqual(stats["duplicate_groups"], 1)
+            self.assertEqual(stats["parse_errors"], 1)
+            self.assertEqual(stats["extraction_errors"], 1)
+            self.assertEqual(stats["missing"], 1)
+            self.assertEqual(repository.search(issue="duplicate")["total"], 1)
+            self.assertEqual(repository.search(issue="parse_error")["total"], 1)
+            self.assertEqual(repository.search(issue="extraction_error")["total"], 1)
+            self.assertEqual(repository.search(issue="missing")["total"], 1)
+
+    def test_incremental_scan_entry_uses_catalog_source_and_guards_concurrency(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "catalog.sqlite"
+            shutil.copy2(self.database, database)
+            repository = ArchiveRepository(database)
+            expected = {"checked": 783, "unchanged": 783, "integrity_check": "ok"}
+            with patch("app.synchronize", return_value=expected) as mocked_sync:
+                self.assertEqual(repository.run_incremental_scan(), expected)
+                mocked_sync.assert_called_once_with(repository.archive_root, database)
+            repository.scan_lock.acquire()
+            try:
+                with self.assertRaises(RuntimeError):
+                    repository.run_incremental_scan()
+            finally:
+                repository.scan_lock.release()
 
     def test_review_filter(self):
         result = ArchiveRepository(self.database).search(review=True, limit=5)

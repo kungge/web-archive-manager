@@ -191,6 +191,15 @@ def synchronize(source: Path, database: Path) -> Dict[str, object]:
         missing_cursor = db.execute("UPDATE assets SET file_status='missing' WHERE file_status!='missing'")
     counts["newly_missing"] = missing_cursor.rowcount
     counts["missing_total"] = db.execute("SELECT COUNT(*) FROM assets WHERE file_status='missing'").fetchone()[0]
+    db.execute("UPDATE assets SET duplicate_group=NULL")
+    duplicate_hashes = [row[0] for row in db.execute("""
+        SELECT sha256 FROM assets WHERE file_status='active' AND sha256 IS NOT NULL
+        GROUP BY sha256 HAVING COUNT(*) > 1
+    """)]
+    for digest in duplicate_hashes:
+        db.execute("UPDATE assets SET duplicate_group=? WHERE sha256=? AND file_status='active'", (digest[:16], digest))
+    counts["duplicate_groups"] = len(duplicate_hashes)
+    counts["duplicate_assets"] = db.execute("SELECT COUNT(*) FROM assets WHERE duplicate_group IS NOT NULL").fetchone()[0]
     db.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('incremental_scan_at',?)", (now_iso(),))
     db.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('file_count',?)", (str(len(current_paths)),))
     db.commit()
