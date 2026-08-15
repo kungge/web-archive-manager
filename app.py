@@ -17,6 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = PROJECT_ROOT / "web"
 DEFAULT_DB = PROJECT_ROOT / "data" / "catalog.sqlite"
 CATEGORIES = ["technology", "ai", "career-work", "finance-business", "life", "society-culture", "productivity-tools", "uncategorized"]
+API_VERSION = 2
 
 
 def connect(database: Path) -> sqlite3.Connection:
@@ -98,7 +99,7 @@ class ArchiveRepository:
             review = db.execute("SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND classification_source='auto-v2'").fetchone()[0]
             favorites = db.execute("SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND is_favorite=1").fetchone()[0]
             read = db.execute("SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND read_status='read'").fetchone()[0]
-        return {"total": total, "ignored": ignored, "indexed": indexed, "review": review, "favorites": favorites, "read": read, "categories": categories, "types": types}
+        return {"api_version": API_VERSION, "total": total, "ignored": ignored, "indexed": indexed, "review": review, "favorites": favorites, "read": read, "categories": categories, "types": types}
 
     def search(self, query: str = "", category: str = "", asset_type: str = "", state_filter: str = "", review: bool = False, page: int = 1, limit: int = 30) -> Dict[str, object]:
         page, limit = max(page, 1), max(1, min(limit, 100))

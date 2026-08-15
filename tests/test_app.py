@@ -3,7 +3,7 @@ import tempfile
 import shutil
 from pathlib import Path
 
-from app import ArchiveRepository, CATEGORIES
+from app import ArchiveRepository, CATEGORIES, API_VERSION
 from scripts.classify_catalog import score_asset
 
 
@@ -16,6 +16,7 @@ class RepositoryTest(unittest.TestCase):
 
     def test_stats_match_catalog(self):
         stats = ArchiveRepository(self.database).stats()
+        self.assertEqual(stats["api_version"], API_VERSION)
         self.assertEqual(stats["total"], 657)
         self.assertEqual(stats["ignored"], 126)
         self.assertEqual(stats["indexed"], 553)

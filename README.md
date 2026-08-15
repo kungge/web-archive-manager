@@ -57,6 +57,8 @@ cd /Users/wankun/github/my-project/web-archive-manager
 python3 app.py
 ```
 
+更新代码后必须重启 Python 服务。只刷新浏览器会加载新前端，但不会重新加载正在运行的后端代码；页面会检测API版本并提示重启。
+
 浏览器打开 `http://127.0.0.1:8765`，可使用：
 
 - 中文标题与正文检索。
