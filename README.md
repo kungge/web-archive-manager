@@ -93,3 +93,7 @@ python3 app.py
 ```
 
 这能避免 HTML、MHTML、笔记和附件在批量移动中损坏，也能让未来的管理工具直接复用索引数据。
+
+## License
+
+Apache License 2.0，详见 [LICENSE](./LICENSE)。
