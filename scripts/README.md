@@ -33,3 +33,17 @@ python3 scripts/build_search_index.py --database data/catalog.sqlite
 python3 scripts/search_catalog.py '离线安装'
 python3 scripts/search_catalog.py 'Nacos' --category technology --limit 10
 ```
+
+自动分类先执行 dry-run：
+
+```bash
+python3 scripts/classify_catalog.py
+```
+
+审阅 `reports/classification-summary.md` 后再写入本地索引：
+
+```bash
+python3 scripts/classify_catalog.py --apply
+```
+
+分类器只处理当前未分类内容，并跳过 `data/user-overrides.json` 中的人工修改。

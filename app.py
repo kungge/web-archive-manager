@@ -34,7 +34,21 @@ class ArchiveRepository:
         self.database = database
         self.override_path = database.parent / "user-overrides.json"
         self.override_lock = threading.Lock()
+        self.ensure_classification_columns()
         self.apply_overrides()
+
+    def ensure_classification_columns(self) -> None:
+        with connect(self.database) as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(assets)")}
+            additions = {
+                "classification_source": "TEXT NOT NULL DEFAULT 'legacy'",
+                "classification_confidence": "REAL",
+                "classification_reason": "TEXT",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    db.execute(f"ALTER TABLE assets ADD COLUMN {name} {definition}")
+            db.commit()
 
     def read_overrides(self) -> Dict[str, object]:
         if not self.override_path.is_file():
@@ -53,7 +67,7 @@ class ArchiveRepository:
                 category = value.get("primary_category")
                 tags = value.get("tags", [])
                 if category in CATEGORIES:
-                    db.execute("UPDATE assets SET primary_category=?, tags_json=? WHERE asset_id=?", (category, json.dumps(tags, ensure_ascii=False), asset_id))
+                    db.execute("UPDATE assets SET primary_category=?, tags_json=?, classification_source='manual', classification_confidence=1.0, classification_reason='用户手工确认' WHERE asset_id=?", (category, json.dumps(tags, ensure_ascii=False), asset_id))
             db.commit()
 
     def write_override(self, asset_id: str, category: str, tags: List[str]) -> None:
@@ -71,9 +85,10 @@ class ArchiveRepository:
             indexed = db.execute("SELECT COUNT(*) FROM contents WHERE extraction_status='success'").fetchone()[0]
             categories = {row[0]: row[1] for row in db.execute("SELECT primary_category, COUNT(*) FROM assets WHERE file_name != '.DS_Store' GROUP BY primary_category")}
             types = {row[0]: row[1] for row in db.execute("SELECT asset_type, COUNT(*) FROM assets WHERE file_name != '.DS_Store' GROUP BY asset_type")}
-        return {"total": total, "ignored": ignored, "indexed": indexed, "categories": categories, "types": types}
+            review = db.execute("SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND classification_source='auto-v2'").fetchone()[0]
+        return {"total": total, "ignored": ignored, "indexed": indexed, "review": review, "categories": categories, "types": types}
 
-    def search(self, query: str = "", category: str = "", asset_type: str = "", page: int = 1, limit: int = 30) -> Dict[str, object]:
+    def search(self, query: str = "", category: str = "", asset_type: str = "", review: bool = False, page: int = 1, limit: int = 30) -> Dict[str, object]:
         page, limit = max(page, 1), max(1, min(limit, 100))
         params: List[object] = []
         filters = ["a.file_name != '.DS_Store'"]
@@ -93,13 +108,17 @@ class ArchiveRepository:
         if asset_type:
             filters.append("a.asset_type = ?")
             params.append(asset_type)
+        if review:
+            filters.append("a.classification_source = 'auto-v2'")
         where = " WHERE " + " AND ".join(filters) if filters else ""
         with connect(self.database) as db:
             total = db.execute(f"SELECT COUNT(*) FROM {source}{where}", params).fetchone()[0]
             rows = db.execute(f"""
                 SELECT a.asset_id, a.title_clean, a.primary_category, a.asset_type,
                        a.source_domain, a.source_url, a.saved_at, a.original_path,
-                       a.size_bytes, a.tags_json, {snippet} AS excerpt, {rank} AS rank
+                       a.size_bytes, a.tags_json, a.classification_source,
+                       a.classification_confidence, a.classification_reason,
+                       {snippet} AS excerpt, {rank} AS rank
                 FROM {source}{where}
                 ORDER BY rank, a.saved_at DESC LIMIT ? OFFSET ?
             """, params + [limit, (page - 1) * limit]).fetchall()
@@ -118,7 +137,7 @@ class ArchiveRepository:
         with connect(self.database) as db:
             if not db.execute("SELECT 1 FROM assets WHERE asset_id=?", (asset_id,)).fetchone():
                 raise KeyError(asset_id)
-            db.execute("UPDATE assets SET primary_category=?, tags_json=? WHERE asset_id=?", (category, json.dumps(normalized_tags, ensure_ascii=False), asset_id))
+            db.execute("UPDATE assets SET primary_category=?, tags_json=?, classification_source='manual', classification_confidence=1.0, classification_reason='用户手工确认' WHERE asset_id=?", (category, json.dumps(normalized_tags, ensure_ascii=False), asset_id))
             db.commit()
         self.write_override(asset_id, category, normalized_tags)
         return {"asset_id": asset_id, "primary_category": category, "tags": normalized_tags}
@@ -157,7 +176,8 @@ class AppHandler(BaseHTTPRequestHandler):
             try:
                 return self.json_response(self.repository.search(
                     query=params.get("q", [""])[0], category=params.get("category", [""])[0],
-                    asset_type=params.get("type", [""])[0], page=int(params.get("page", ["1"])[0]),
+                    asset_type=params.get("type", [""])[0], review=params.get("review", ["0"])[0] == "1",
+                    page=int(params.get("page", ["1"])[0]),
                     limit=int(params.get("limit", ["30"])[0])))
             except (ValueError, sqlite3.Error) as exc:
                 return self.error_response(400, str(exc))

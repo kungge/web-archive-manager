@@ -36,6 +36,7 @@
 | [04-工具需求草案.md](./04-工具需求草案.md) | 沉淀后续管理工具的范围、功能和技术方向 |
 | [资产清单扫描报告](./reports/scan-summary.md) | 全量文件统计、格式、资产类型和初步分类结果 |
 | [全文索引构建报告](./reports/search-index-summary.md) | 正文抽取、全文索引结果与当前限制 |
+| 自动分类报告（本地生成） | `reports/classification-summary.md`，包含本地标题，不提交 Git |
 
 ## 当前可用能力
 
@@ -62,6 +63,7 @@ python3 app.py
 - 按 8 个主分类、档案类型筛选。
 - 查看来源、保存时间、本地路径和正文预览。
 - 人工修正主分类和标签。
+- 查看自动分类置信度与依据，并集中处理待确认建议。
 
 应用只监听本机地址，不上传网页内容，不移动归档原件。
 人工修改会写入本地 `data/user-overrides.json`，应用重启或重新生成索引后仍会重新应用。
@@ -75,6 +77,20 @@ python3 app.py
 - `reports/inventory.jsonl`：逐文件资产清单。
 
 克隆代码到新机器后，需要先运行 `build_catalog.py` 和 `build_search_index.py` 重新生成本地数据。
+
+## 自动分类
+
+分类器只填充未分类内容，不覆盖既有分类和人工修改。建议先预览：
+
+```bash
+python3 scripts/classify_catalog.py
+```
+
+确认 `reports/classification-summary.md` 后应用：
+
+```bash
+python3 scripts/classify_catalog.py --apply
+```
 
 ## 核心结论
 
