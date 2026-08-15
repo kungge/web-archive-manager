@@ -44,6 +44,9 @@ class ArchiveRepository:
                 "classification_source": "TEXT NOT NULL DEFAULT 'legacy'",
                 "classification_confidence": "REAL",
                 "classification_reason": "TEXT",
+                "is_favorite": "INTEGER NOT NULL DEFAULT 0",
+                "read_status": "TEXT NOT NULL DEFAULT 'unread'",
+                "personal_note": "TEXT NOT NULL DEFAULT ''",
             }
             for name, definition in additions.items():
                 if name not in columns:
@@ -66,14 +69,21 @@ class ArchiveRepository:
             for asset_id, value in overrides.items():
                 category = value.get("primary_category")
                 tags = value.get("tags", [])
-                if category in CATEGORIES:
-                    db.execute("UPDATE assets SET primary_category=?, tags_json=?, classification_source='manual', classification_confidence=1.0, classification_reason='用户手工确认' WHERE asset_id=?", (category, json.dumps(tags, ensure_ascii=False), asset_id))
+                favorite = int(bool(value.get("is_favorite", False)))
+                read_status = value.get("read_status", "unread")
+                note = value.get("personal_note", "")
+                if category in CATEGORIES and read_status in {"read", "unread"}:
+                    db.execute("""
+                        UPDATE assets SET primary_category=?, tags_json=?, classification_source='manual',
+                        classification_confidence=1.0, classification_reason='用户手工确认',
+                        is_favorite=?, read_status=?, personal_note=? WHERE asset_id=?
+                    """, (category, json.dumps(tags, ensure_ascii=False), favorite, read_status, note, asset_id))
             db.commit()
 
-    def write_override(self, asset_id: str, category: str, tags: List[str]) -> None:
+    def write_override(self, asset_id: str, value: Dict[str, object]) -> None:
         with self.override_lock:
             overrides = self.read_overrides()
-            overrides[asset_id] = {"primary_category": category, "tags": tags}
+            overrides[asset_id] = value
             temp = self.override_path.with_suffix(".tmp")
             temp.write_text(json.dumps(overrides, ensure_ascii=False, indent=2), encoding="utf-8")
             temp.replace(self.override_path)
@@ -86,9 +96,11 @@ class ArchiveRepository:
             categories = {row[0]: row[1] for row in db.execute("SELECT primary_category, COUNT(*) FROM assets WHERE file_name != '.DS_Store' GROUP BY primary_category")}
             types = {row[0]: row[1] for row in db.execute("SELECT asset_type, COUNT(*) FROM assets WHERE file_name != '.DS_Store' GROUP BY asset_type")}
             review = db.execute("SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND classification_source='auto-v2'").fetchone()[0]
-        return {"total": total, "ignored": ignored, "indexed": indexed, "review": review, "categories": categories, "types": types}
+            favorites = db.execute("SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND is_favorite=1").fetchone()[0]
+            read = db.execute("SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND read_status='read'").fetchone()[0]
+        return {"total": total, "ignored": ignored, "indexed": indexed, "review": review, "favorites": favorites, "read": read, "categories": categories, "types": types}
 
-    def search(self, query: str = "", category: str = "", asset_type: str = "", review: bool = False, page: int = 1, limit: int = 30) -> Dict[str, object]:
+    def search(self, query: str = "", category: str = "", asset_type: str = "", state_filter: str = "", review: bool = False, page: int = 1, limit: int = 30) -> Dict[str, object]:
         page, limit = max(page, 1), max(1, min(limit, 100))
         params: List[object] = []
         filters = ["a.file_name != '.DS_Store'"]
@@ -110,6 +122,11 @@ class ArchiveRepository:
             params.append(asset_type)
         if review:
             filters.append("a.classification_source = 'auto-v2'")
+        if state_filter == "favorite":
+            filters.append("a.is_favorite = 1")
+        elif state_filter in {"read", "unread"}:
+            filters.append("a.read_status = ?")
+            params.append(state_filter)
         where = " WHERE " + " AND ".join(filters) if filters else ""
         with connect(self.database) as db:
             total = db.execute(f"SELECT COUNT(*) FROM {source}{where}", params).fetchone()[0]
@@ -118,6 +135,7 @@ class ArchiveRepository:
                        a.source_domain, a.source_url, a.saved_at, a.original_path,
                        a.size_bytes, a.tags_json, a.classification_source,
                        a.classification_confidence, a.classification_reason,
+                       a.is_favorite, a.read_status, a.personal_note,
                        {snippet} AS excerpt, {rank} AS rank
                 FROM {source}{where}
                 ORDER BY rank, a.saved_at DESC LIMIT ? OFFSET ?
@@ -130,17 +148,29 @@ class ArchiveRepository:
             items.append(item)
         return {"items": items, "total": total, "page": page, "limit": limit, "pages": max(1, (total + limit - 1) // limit)}
 
-    def update_asset(self, asset_id: str, category: str, tags: Optional[List[str]]) -> Dict[str, object]:
-        if category not in CATEGORIES:
-            raise ValueError("unknown category")
-        normalized_tags = sorted({tag.strip() for tag in (tags or []) if tag.strip()})
+    def update_asset(self, asset_id: str, category: Optional[str], tags: Optional[List[str]], is_favorite: Optional[bool] = None, read_status: Optional[str] = None, personal_note: Optional[str] = None) -> Dict[str, object]:
         with connect(self.database) as db:
-            if not db.execute("SELECT 1 FROM assets WHERE asset_id=?", (asset_id,)).fetchone():
+            current = db.execute("SELECT primary_category,tags_json,is_favorite,read_status,personal_note FROM assets WHERE asset_id=?", (asset_id,)).fetchone()
+            if not current:
                 raise KeyError(asset_id)
-            db.execute("UPDATE assets SET primary_category=?, tags_json=?, classification_source='manual', classification_confidence=1.0, classification_reason='用户手工确认' WHERE asset_id=?", (category, json.dumps(normalized_tags, ensure_ascii=False), asset_id))
+            category = category or current[0]
+            if category not in CATEGORIES:
+                raise ValueError("unknown category")
+            normalized_tags = sorted({tag.strip() for tag in (tags if tags is not None else json.loads(current[1])) if tag.strip()})
+            favorite_value = int(bool(is_favorite)) if is_favorite is not None else current[2]
+            read_value = read_status if read_status is not None else current[3]
+            note_value = personal_note if personal_note is not None else current[4]
+            if read_value not in {"read", "unread"}:
+                raise ValueError("unknown read status")
+            db.execute("""
+                UPDATE assets SET primary_category=?, tags_json=?, classification_source='manual',
+                classification_confidence=1.0, classification_reason='用户手工确认',
+                is_favorite=?, read_status=?, personal_note=? WHERE asset_id=?
+            """, (category, json.dumps(normalized_tags, ensure_ascii=False), favorite_value, read_value, note_value, asset_id))
             db.commit()
-        self.write_override(asset_id, category, normalized_tags)
-        return {"asset_id": asset_id, "primary_category": category, "tags": normalized_tags}
+        override = {"primary_category": category, "tags": normalized_tags, "is_favorite": bool(favorite_value), "read_status": read_value, "personal_note": note_value}
+        self.write_override(asset_id, override)
+        return {"asset_id": asset_id, **override}
 
     def get_asset(self, asset_id: str) -> Dict[str, object]:
         with connect(self.database) as db:
@@ -177,6 +207,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 return self.json_response(self.repository.search(
                     query=params.get("q", [""])[0], category=params.get("category", [""])[0],
                     asset_type=params.get("type", [""])[0], review=params.get("review", ["0"])[0] == "1",
+                    state_filter=params.get("state", [""])[0],
                     page=int(params.get("page", ["1"])[0]),
                     limit=int(params.get("limit", ["30"])[0])))
             except (ValueError, sqlite3.Error) as exc:
@@ -195,7 +226,10 @@ class AppHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
-            result = self.repository.update_asset(parsed.path.rsplit("/", 1)[-1], payload.get("primary_category", ""), payload.get("tags", []))
+            result = self.repository.update_asset(
+                parsed.path.rsplit("/", 1)[-1], payload.get("primary_category"), payload.get("tags"),
+                payload.get("is_favorite"), payload.get("read_status"), payload.get("personal_note"),
+            )
             self.json_response(result)
         except KeyError:
             self.error_response(404, "asset not found")

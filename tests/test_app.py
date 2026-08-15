@@ -19,6 +19,7 @@ class RepositoryTest(unittest.TestCase):
         self.assertEqual(stats["total"], 657)
         self.assertEqual(stats["ignored"], 126)
         self.assertEqual(stats["indexed"], 553)
+        self.assertEqual(stats["review"], 0)
         self.assertTrue(set(stats["categories"]).issubset(CATEGORIES))
 
     def test_chinese_full_text_search(self):
@@ -45,6 +46,20 @@ class RepositoryTest(unittest.TestCase):
             restored = ArchiveRepository(database).get_asset(asset["asset_id"])
             self.assertEqual(restored["primary_category"], "life")
             self.assertEqual(restored["tags"], ["topic:test"])
+
+    def test_favorite_read_and_note_persist(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "catalog.sqlite"
+            shutil.copy2(self.database, database)
+            repository = ArchiveRepository(database)
+            asset = repository.search(limit=1)["items"][0]
+            repository.update_asset(asset["asset_id"], None, None, True, "read", "稍后整理成知识笔记")
+            restored = ArchiveRepository(database).get_asset(asset["asset_id"])
+            self.assertEqual(restored["is_favorite"], 1)
+            self.assertEqual(restored["read_status"], "read")
+            self.assertEqual(restored["personal_note"], "稍后整理成知识笔记")
+            favorite_results = ArchiveRepository(database).search(state_filter="favorite", limit=10)
+            self.assertTrue(any(item["asset_id"] == asset["asset_id"] for item in favorite_results["items"]))
 
 
 class ClassifierTest(unittest.TestCase):

@@ -64,16 +64,17 @@ python3 app.py
 - 查看来源、保存时间、本地路径和正文预览。
 - 人工修正主分类和标签。
 - 查看自动分类置信度与依据，并集中处理待确认建议。
+- 收藏网页、维护已读/待读状态并添加个人备注。
 
 应用只监听本机地址，不上传网页内容，不移动归档原件。
-人工修改会写入本地 `data/user-overrides.json`，应用重启或重新生成索引后仍会重新应用。
+人工分类、标签、收藏、阅读状态和备注会写入本地 `data/user-overrides.json`，应用重启或重新生成索引后仍会重新应用。
 
 ## 数据与 Git
 
 以下内容默认不提交到 GitHub：
 
 - `data/catalog.sqlite`：包含本机网页正文索引和绝对路径。
-- `data/user-overrides.json`：个人分类与标签修改。
+- `data/user-overrides.json`：个人分类、标签、收藏、阅读状态和备注。
 - `reports/inventory.jsonl`：逐文件资产清单。
 
 克隆代码到新机器后，需要先运行 `build_catalog.py` 和 `build_search_index.py` 重新生成本地数据。

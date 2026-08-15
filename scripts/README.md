@@ -47,3 +47,9 @@ python3 scripts/classify_catalog.py --apply
 ```
 
 分类器只处理当前未分类内容，并跳过 `data/user-overrides.json` 中的人工修改。
+
+批量确认所有自动建议：
+
+```bash
+python3 scripts/classify_catalog.py --confirm-all
+```

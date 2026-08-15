@@ -115,6 +115,20 @@ def classify(database: Path, apply: bool) -> Dict[str, object]:
     return {"mode": "apply" if apply else "dry-run", "candidates": len(rows), "suggested": len(suggestions), "remaining": counts["uncategorized"], "manual_skipped": counts["manual_skipped"], "categories": dict(counts), "suggestions": suggestions}
 
 
+def confirm_all(database: Path) -> int:
+    db = sqlite3.connect(str(database))
+    ensure_columns(db)
+    cursor = db.execute("""
+        UPDATE assets SET classification_source='confirmed-auto',
+        classification_reason=COALESCE(classification_reason,'') || '；用户批量确认'
+        WHERE classification_source='auto-v2'
+    """)
+    db.commit()
+    count = cursor.rowcount
+    db.close()
+    return count
+
+
 def write_report(path: Path, result: Dict[str, object]) -> None:
     lines = [
         "# 自动分类报告", "", f"> 模式：`{result['mode']}`", "", "## 汇总", "",
@@ -136,8 +150,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", type=Path, default=Path("data/catalog.sqlite"))
     parser.add_argument("--apply", action="store_true", help="write suggestions to the local catalog")
+    parser.add_argument("--confirm-all", action="store_true", help="confirm every pending auto-v2 suggestion")
     parser.add_argument("--report", type=Path, default=Path("reports/classification-summary.md"))
     args = parser.parse_args()
+    if args.confirm_all:
+        count = confirm_all(args.database)
+        print(json.dumps({"confirmed": count}, ensure_ascii=False, indent=2))
+        return 0
     result = classify(args.database, args.apply)
     write_report(args.report, result)
     printable = {key: value for key, value in result.items() if key != "suggestions"}
