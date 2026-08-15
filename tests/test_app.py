@@ -41,6 +41,26 @@ class RepositoryTest(unittest.TestCase):
         self.assertGreater(result["total"], 0)
         self.assertTrue(all(item["primary_category"] == "technology" for item in result["items"]))
 
+    def test_domain_date_and_sort_filters(self):
+        repository = ArchiveRepository(self.database)
+        sample = next(item for item in repository.search(limit=100)["items"] if item["source_domain"] and item["saved_at"])
+        saved_date = sample["saved_at"][:10]
+        result = repository.search(domain=sample["source_domain"], date_from=saved_date, date_to=saved_date, sort="size_desc", limit=100)
+        self.assertGreater(result["total"], 0)
+        self.assertTrue(all(item["source_domain"] == sample["source_domain"] for item in result["items"]))
+        self.assertTrue(all(item["saved_at"][:10] == saved_date for item in result["items"]))
+        sizes = [item["size_bytes"] for item in result["items"]]
+        self.assertEqual(sizes, sorted(sizes, reverse=True))
+
+    def test_search_rejects_invalid_date_and_sort(self):
+        repository = ArchiveRepository(self.database)
+        with self.assertRaises(ValueError):
+            repository.search(date_from="2026-99-99")
+        with self.assertRaises(ValueError):
+            repository.search(date_from="2026-08-16", date_to="2026-08-15")
+        with self.assertRaises(ValueError):
+            repository.search(sort="drop-table")
+
     def test_review_filter(self):
         result = ArchiveRepository(self.database).search(review=True, limit=5)
         self.assertTrue(all(item["classification_source"] == "auto-v2" for item in result["items"]))

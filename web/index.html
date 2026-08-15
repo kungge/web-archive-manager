@@ -34,6 +34,14 @@
           <div class="filter-group"><h2>档案类型</h2><div id="typeFilters" class="filter-list"></div></div>
         </aside>
         <section class="results-panel">
+          <form class="catalog-slip" id="catalogControls">
+            <label><span>从</span><input id="dateFrom" type="date"></label>
+            <label><span>到</span><input id="dateTo" type="date"></label>
+            <label class="domain-control"><span>来源</span><select id="domainFilter"><option value="">全部来源</option></select></label>
+            <label class="sort-control"><span>顺序</span><select id="sortOrder"><option value="saved_desc">最近保存</option><option value="saved_asc">最早保存</option><option value="modified_desc">最近修改</option><option value="size_desc">文件最大</option><option value="relevance">搜索相关度</option></select></label>
+            <button type="submit">应用</button>
+          </form>
+          <div id="activeCriteria" class="active-criteria" aria-live="polite"></div>
           <div class="results-head"><div><span id="resultCount">—</span><small>份匹配档案</small></div><p id="resultContext">按保存时间浏览全部内容</p></div>
           <div id="results" class="results" aria-live="polite"></div>
           <nav id="pagination" class="pagination" aria-label="分页"></nav>

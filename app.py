@@ -18,7 +18,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = PROJECT_ROOT / "web"
 DEFAULT_DB = PROJECT_ROOT / "data" / "catalog.sqlite"
 CATEGORIES = ["technology", "ai", "career-work", "finance-business", "life", "society-culture", "productivity-tools", "uncategorized"]
-API_VERSION = 4
+API_VERSION = 5
+SORT_OPTIONS = {
+    "saved_desc": "a.saved_at DESC, a.asset_id",
+    "saved_asc": "a.saved_at ASC, a.asset_id",
+    "modified_desc": "a.modified_at DESC, a.asset_id",
+    "size_desc": "a.size_bytes DESC, a.asset_id",
+}
 
 
 def connect(database: Path) -> sqlite3.Connection:
@@ -112,10 +118,25 @@ class ArchiveRepository:
             review = db.execute(f"SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND {active} AND classification_source='auto-v2'").fetchone()[0]
             favorites = db.execute(f"SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND {active} AND is_favorite=1").fetchone()[0]
             read = db.execute(f"SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND {active} AND read_status='read'").fetchone()[0]
-        return {"api_version": API_VERSION, "total": total, "ignored": ignored, "missing": missing, "indexed": indexed, "review": review, "favorites": favorites, "read": read, "categories": categories, "types": types}
+            domains = [{"domain": row[0], "count": row[1]} for row in db.execute(f"""
+                SELECT source_domain, COUNT(*) FROM assets
+                WHERE file_name != '.DS_Store' AND {active} AND source_domain IS NOT NULL AND source_domain != ''
+                GROUP BY source_domain ORDER BY COUNT(*) DESC, source_domain LIMIT 30
+            """)]
+        return {"api_version": API_VERSION, "total": total, "ignored": ignored, "missing": missing, "indexed": indexed, "review": review, "favorites": favorites, "read": read, "categories": categories, "types": types, "domains": domains}
 
-    def search(self, query: str = "", category: str = "", asset_type: str = "", state_filter: str = "", review: bool = False, page: int = 1, limit: int = 30) -> Dict[str, object]:
+    def search(self, query: str = "", category: str = "", asset_type: str = "", state_filter: str = "", review: bool = False, page: int = 1, limit: int = 30, domain: str = "", date_from: str = "", date_to: str = "", sort: str = "saved_desc") -> Dict[str, object]:
         page, limit = max(page, 1), max(1, min(limit, 100))
+        if sort not in SORT_OPTIONS and sort != "relevance":
+            raise ValueError("unknown sort option")
+        for value in (date_from, date_to):
+            if value:
+                try:
+                    __import__("datetime").date.fromisoformat(value)
+                except ValueError as exc:
+                    raise ValueError("date must use YYYY-MM-DD") from exc
+        if date_from and date_to and date_from > date_to:
+            raise ValueError("start date must not be later than end date")
         params: List[object] = []
         filters = ["a.file_name != '.DS_Store'", "a.file_status = 'active'"]
         if query.strip():
@@ -134,6 +155,15 @@ class ArchiveRepository:
         if asset_type:
             filters.append("a.asset_type = ?")
             params.append(asset_type)
+        if domain:
+            filters.append("a.source_domain = ?")
+            params.append(domain)
+        if date_from:
+            filters.append("substr(a.saved_at,1,10) >= ?")
+            params.append(date_from)
+        if date_to:
+            filters.append("substr(a.saved_at,1,10) <= ?")
+            params.append(date_to)
         if review:
             filters.append("a.classification_source = 'auto-v2'")
         if state_filter == "favorite":
@@ -142,6 +172,7 @@ class ArchiveRepository:
             filters.append("a.read_status = ?")
             params.append(state_filter)
         where = " WHERE " + " AND ".join(filters) if filters else ""
+        order_by = rank if query.strip() and sort == "relevance" else SORT_OPTIONS.get(sort, SORT_OPTIONS["saved_desc"])
         with connect(self.database) as db:
             total = db.execute(f"SELECT COUNT(*) FROM {source}{where}", params).fetchone()[0]
             rows = db.execute(f"""
@@ -152,7 +183,7 @@ class ArchiveRepository:
                        a.is_favorite, a.read_status, a.personal_note,
                        {snippet} AS excerpt, {rank} AS rank
                 FROM {source}{where}
-                ORDER BY rank, a.saved_at DESC LIMIT ? OFFSET ?
+                ORDER BY {order_by} LIMIT ? OFFSET ?
             """, params + [limit, (page - 1) * limit]).fetchall()
         items = []
         for row in rows:
@@ -240,6 +271,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     query=params.get("q", [""])[0], category=params.get("category", [""])[0],
                     asset_type=params.get("type", [""])[0], review=params.get("review", ["0"])[0] == "1",
                     state_filter=params.get("state", [""])[0],
+                    domain=params.get("domain", [""])[0], date_from=params.get("from", [""])[0],
+                    date_to=params.get("to", [""])[0], sort=params.get("sort", ["saved_desc"])[0],
                     page=int(params.get("page", ["1"])[0]),
                     limit=int(params.get("limit", ["30"])[0])))
             except (ValueError, sqlite3.Error) as exc:
