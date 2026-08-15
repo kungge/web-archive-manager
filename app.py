@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = PROJECT_ROOT / "web"
 DEFAULT_DB = PROJECT_ROOT / "data" / "catalog.sqlite"
 CATEGORIES = ["technology", "ai", "career-work", "finance-business", "life", "society-culture", "productivity-tools", "uncategorized"]
-API_VERSION = 6
+API_VERSION = 7
 SORT_OPTIONS = {
     "saved_desc": "a.saved_at DESC, a.asset_id",
     "saved_asc": "a.saved_at ASC, a.asset_id",
@@ -93,12 +93,22 @@ class ArchiveRepository:
                 favorite = int(bool(value.get("is_favorite", False)))
                 read_status = value.get("read_status", "unread")
                 note = value.get("personal_note", "")
+                title = value.get("title_clean")
+                source_url = value.get("source_url")
+                source_domain = urlparse(source_url).hostname if source_url else None
+                has_title = "title_clean" in value
+                has_source = "source_url" in value
                 if category in CATEGORIES and read_status in {"read", "unread"}:
                     db.execute("""
                         UPDATE assets SET primary_category=?, tags_json=?, classification_source='manual',
                         classification_confidence=1.0, classification_reason='用户手工确认',
-                        is_favorite=?, read_status=?, personal_note=? WHERE asset_id=?
-                    """, (category, json.dumps(tags, ensure_ascii=False), favorite, read_status, note, asset_id))
+                        is_favorite=?, read_status=?, personal_note=?,
+                        title_clean=CASE WHEN ? THEN ? ELSE title_clean END,
+                        source_url=CASE WHEN ? THEN ? ELSE source_url END,
+                        source_domain=CASE WHEN ? THEN ? ELSE source_domain END WHERE asset_id=?
+                    """, (category, json.dumps(tags, ensure_ascii=False), favorite, read_status, note, has_title, title, has_source, source_url, has_source, source_domain, asset_id))
+                    if has_title and title:
+                        db.execute("UPDATE contents_fts SET title=? WHERE asset_id=?", (title, asset_id))
             db.commit()
 
     def write_override(self, asset_id: str, value: Dict[str, object]) -> None:
@@ -130,10 +140,15 @@ class ArchiveRepository:
             duplicate_groups = db.execute(f"SELECT COUNT(DISTINCT duplicate_group) FROM assets WHERE file_name != '.DS_Store' AND {active} AND duplicate_group IS NOT NULL").fetchone()[0]
             parse_errors = db.execute(f"SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND {active} AND parse_status='error'").fetchone()[0]
             extraction_errors = db.execute(f"SELECT COUNT(*) FROM contents c JOIN assets a USING(asset_id) WHERE a.file_name != '.DS_Store' AND {active} AND c.extraction_status='error'").fetchone()[0]
+            tags = [{"tag": row[0], "count": row[1]} for row in db.execute(f"""
+                SELECT tag.value, COUNT(*) FROM assets a, json_each(a.tags_json) tag
+                WHERE a.file_name != '.DS_Store' AND {active} AND tag.value NOT LIKE 'format:%'
+                GROUP BY tag.value ORDER BY COUNT(*) DESC, tag.value LIMIT 20
+            """)]
         maintenance = {"duplicate_assets": duplicate_assets, "duplicate_groups": duplicate_groups, "parse_errors": parse_errors, "extraction_errors": extraction_errors, "missing": missing}
-        return {"api_version": API_VERSION, "total": total, "ignored": ignored, "missing": missing, "indexed": indexed, "review": review, "favorites": favorites, "read": read, "categories": categories, "types": types, "domains": domains, "maintenance": maintenance}
+        return {"api_version": API_VERSION, "total": total, "ignored": ignored, "missing": missing, "indexed": indexed, "review": review, "favorites": favorites, "read": read, "categories": categories, "types": types, "domains": domains, "tags": tags, "maintenance": maintenance}
 
-    def search(self, query: str = "", category: str = "", asset_type: str = "", state_filter: str = "", review: bool = False, page: int = 1, limit: int = 30, domain: str = "", date_from: str = "", date_to: str = "", sort: str = "saved_desc", issue: str = "") -> Dict[str, object]:
+    def search(self, query: str = "", category: str = "", asset_type: str = "", state_filter: str = "", review: bool = False, page: int = 1, limit: int = 30, domain: str = "", date_from: str = "", date_to: str = "", sort: str = "saved_desc", issue: str = "", tag: str = "") -> Dict[str, object]:
         page, limit = max(page, 1), max(1, min(limit, 100))
         if sort not in SORT_OPTIONS and sort != "relevance":
             raise ValueError("unknown sort option")
@@ -168,6 +183,9 @@ class ArchiveRepository:
         if domain:
             filters.append("a.source_domain = ?")
             params.append(domain)
+        if tag:
+            filters.append("EXISTS (SELECT 1 FROM json_each(a.tags_json) selected_tag WHERE selected_tag.value = ?)")
+            params.append(tag)
         if date_from:
             filters.append("substr(a.saved_at,1,10) >= ?")
             params.append(date_from)
@@ -222,9 +240,9 @@ class ArchiveRepository:
         finally:
             self.scan_lock.release()
 
-    def update_asset(self, asset_id: str, category: Optional[str], tags: Optional[List[str]], is_favorite: Optional[bool] = None, read_status: Optional[str] = None, personal_note: Optional[str] = None) -> Dict[str, object]:
+    def update_asset(self, asset_id: str, category: Optional[str], tags: Optional[List[str]], is_favorite: Optional[bool] = None, read_status: Optional[str] = None, personal_note: Optional[str] = None, title_clean: Optional[str] = None, source_url: Optional[str] = None) -> Dict[str, object]:
         with connect(self.database) as db:
-            current = db.execute("SELECT primary_category,tags_json,is_favorite,read_status,personal_note FROM assets WHERE asset_id=?", (asset_id,)).fetchone()
+            current = db.execute("SELECT primary_category,tags_json,is_favorite,read_status,personal_note,title_clean,source_url FROM assets WHERE asset_id=?", (asset_id,)).fetchone()
             if not current:
                 raise KeyError(asset_id)
             category = category or current[0]
@@ -234,15 +252,23 @@ class ArchiveRepository:
             favorite_value = int(bool(is_favorite)) if is_favorite is not None else current[2]
             read_value = read_status if read_status is not None else current[3]
             note_value = personal_note if personal_note is not None else current[4]
+            title_value = (title_clean if title_clean is not None else current[5] or "").strip()
+            source_value = (source_url if source_url is not None else current[6] or "").strip() or None
             if read_value not in {"read", "unread"}:
                 raise ValueError("unknown read status")
+            if not title_value or len(title_value) > 1000:
+                raise ValueError("title must contain 1 to 1000 characters")
+            if source_value and urlparse(source_value).scheme not in {"http", "https"}:
+                raise ValueError("source URL must use http or https")
+            source_domain = urlparse(source_value).hostname if source_value else None
             db.execute("""
                 UPDATE assets SET primary_category=?, tags_json=?, classification_source='manual',
                 classification_confidence=1.0, classification_reason='用户手工确认',
-                is_favorite=?, read_status=?, personal_note=? WHERE asset_id=?
-            """, (category, json.dumps(normalized_tags, ensure_ascii=False), favorite_value, read_value, note_value, asset_id))
+                is_favorite=?, read_status=?, personal_note=?, title_clean=?, source_url=?, source_domain=? WHERE asset_id=?
+            """, (category, json.dumps(normalized_tags, ensure_ascii=False), favorite_value, read_value, note_value, title_value, source_value, source_domain, asset_id))
+            db.execute("UPDATE contents_fts SET title=? WHERE asset_id=?", (title_value, asset_id))
             db.commit()
-        override = {"primary_category": category, "tags": normalized_tags, "is_favorite": bool(favorite_value), "read_status": read_value, "personal_note": note_value}
+        override = {"primary_category": category, "tags": normalized_tags, "is_favorite": bool(favorite_value), "read_status": read_value, "personal_note": note_value, "title_clean": title_value, "source_url": source_value}
         self.write_override(asset_id, override)
         return {"asset_id": asset_id, **override}
 
@@ -278,6 +304,10 @@ def open_local_file(path: Path) -> None:
     subprocess.Popen(["open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def reveal_local_file(path: Path) -> None:
+    subprocess.Popen(["open", "-R", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 class AppHandler(BaseHTTPRequestHandler):
     repository: ArchiveRepository
 
@@ -307,6 +337,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     domain=params.get("domain", [""])[0], date_from=params.get("from", [""])[0],
                     date_to=params.get("to", [""])[0], sort=params.get("sort", ["saved_desc"])[0],
                     issue=params.get("issue", [""])[0],
+                    tag=params.get("tag", [""])[0],
                     page=int(params.get("page", ["1"])[0]),
                     limit=int(params.get("limit", ["30"])[0])))
             except (ValueError, sqlite3.Error) as exc:
@@ -329,6 +360,18 @@ class AppHandler(BaseHTTPRequestHandler):
                 return self.error_response(409, str(exc))
             except (OSError, sqlite3.Error, ValueError) as exc:
                 return self.error_response(500, str(exc))
+        if parsed.path.startswith("/api/assets/") and parsed.path.endswith("/reveal"):
+            asset_id = parsed.path.split("/")[-2]
+            try:
+                path = self.repository.get_local_file(asset_id)
+                reveal_local_file(path)
+                return self.json_response({"revealed": True, "asset_id": asset_id})
+            except KeyError:
+                return self.error_response(404, "asset not found")
+            except FileNotFoundError:
+                return self.error_response(410, "local file no longer exists")
+            except PermissionError as exc:
+                return self.error_response(403, str(exc))
         if not parsed.path.startswith("/api/assets/") or not parsed.path.endswith("/open"):
             return self.error_response(404, "not found")
         asset_id = parsed.path.split("/")[-2]
@@ -355,6 +398,7 @@ class AppHandler(BaseHTTPRequestHandler):
             result = self.repository.update_asset(
                 parsed.path.rsplit("/", 1)[-1], payload.get("primary_category"), payload.get("tags"),
                 payload.get("is_favorite"), payload.get("read_status"), payload.get("personal_note"),
+                payload.get("title_clean"), payload.get("source_url"),
             )
             self.json_response(result)
         except KeyError:

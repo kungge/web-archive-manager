@@ -52,6 +52,15 @@ class RepositoryTest(unittest.TestCase):
         sizes = [item["size_bytes"] for item in result["items"]]
         self.assertEqual(sizes, sorted(sizes, reverse=True))
 
+    def test_common_tag_filter_is_exact(self):
+        repository = ArchiveRepository(self.database)
+        common_tags = repository.stats()["tags"]
+        self.assertGreater(len(common_tags), 0)
+        selected = common_tags[0]["tag"]
+        result = repository.search(tag=selected, limit=100)
+        self.assertEqual(result["total"], common_tags[0]["count"])
+        self.assertTrue(all(selected in item["tags"] for item in result["items"]))
+
     def test_search_rejects_invalid_date_and_sort(self):
         repository = ArchiveRepository(self.database)
         with self.assertRaises(ValueError):
@@ -131,6 +140,26 @@ class RepositoryTest(unittest.TestCase):
             favorite_results = ArchiveRepository(database).search(state_filter="favorite", limit=10)
             self.assertTrue(any(item["asset_id"] == asset["asset_id"] for item in favorite_results["items"]))
 
+    def test_title_and_source_override_persist_and_update_search(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "catalog.sqlite"
+            shutil.copy2(self.database, database)
+            repository = ArchiveRepository(database)
+            asset = repository.search(asset_type="web-html", limit=1)["items"][0]
+            title = "自定义归档标题 AlphaMeta"
+            source = "https://example.com/archive/item"
+            saved = repository.update_asset(asset["asset_id"], None, None, title_clean=title, source_url=source)
+            self.assertEqual(saved["title_clean"], title)
+            restored = ArchiveRepository(database).get_asset(asset["asset_id"])
+            self.assertEqual(restored["title_clean"], title)
+            self.assertEqual(restored["source_url"], source)
+            self.assertEqual(restored["source_domain"], "example.com")
+            self.assertEqual(ArchiveRepository(database).search(query="AlphaMeta")["total"], 1)
+            with self.assertRaises(ValueError):
+                repository.update_asset(asset["asset_id"], None, None, title_clean="")
+            with self.assertRaises(ValueError):
+                repository.update_asset(asset["asset_id"], None, None, source_url="file:///tmp/item")
+
     def test_local_file_is_restricted_to_archive_root(self):
         repository = ArchiveRepository(self.database)
         html_asset = repository.search(asset_type="web-html", limit=1)["items"][0]
@@ -158,6 +187,11 @@ class RepositoryTest(unittest.TestCase):
                 with urllib.request.urlopen(request) as response:
                     self.assertEqual(response.status, 200)
                 mocked_open.assert_called_once()
+            reveal_request = urllib.request.Request(f"{base}/api/assets/{html_asset['asset_id']}/reveal", method="POST", data=b"")
+            with patch("app.reveal_local_file") as mocked_reveal:
+                with urllib.request.urlopen(reveal_request) as response:
+                    self.assertEqual(response.status, 200)
+                mocked_reveal.assert_called_once()
         finally:
             server.shutdown()
             server.server_close()
