@@ -19,6 +19,16 @@ reports/scan-summary.md
 
 重复运行会完整重建索引，并在全部扫描结束后原子替换上一版索引。
 
+日常新增网页后使用增量扫描，不必重建整个目录：
+
+```bash
+python3 scripts/incremental_scan.py \
+  --source '/Users/wankun/allbak/网页' \
+  --database data/catalog.sqlite
+```
+
+脚本会跳过未变化文件，更新内容有变化的文件，并识别新增、移动和缺失文件。缺失项只标记为 `missing`，不会删除索引记录；移动或更新也会保留原有资产 ID、收藏、已读状态和个人备注。运行摘要写入 `reports/incremental-scan-summary.json`。
+
 生成资产清单后，构建正文与全文检索索引：
 
 ```bash

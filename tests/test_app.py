@@ -4,11 +4,15 @@ import shutil
 import threading
 import urllib.error
 import urllib.request
+import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
 from app import ArchiveRepository, AppHandler, CATEGORIES, API_VERSION, ThreadingHTTPServer
 from scripts.classify_catalog import score_asset
+from scripts.build_catalog import scan
+from scripts.build_search_index import build
+from scripts.incremental_scan import synchronize
 
 
 class RepositoryTest(unittest.TestCase):
@@ -109,6 +113,47 @@ class ClassifierTest(unittest.TestCase):
     def test_body_noise_does_not_force_category(self):
         category, _, _ = score_asset("article-viewed/example.mhtml", "如何学好英语", "历史 文化 电影 演员 新闻 教育")
         self.assertEqual(category, "uncategorized")
+
+
+class IncrementalScanTest(unittest.TestCase):
+    def test_add_update_move_and_missing_preserve_identity_and_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "archive"
+            output = root / "catalog"
+            source.mkdir()
+            original = source / "first.html"
+            original.write_text("<html><title>Java 入门</title><body>第一版正文</body></html>", encoding="utf-8")
+            scan(source, output)
+            database = output / "data" / "catalog.sqlite"
+            build(database)
+
+            first = synchronize(source, database)
+            self.assertEqual(first["unchanged"], 1)
+            with sqlite3.connect(database) as db:
+                asset_id = db.execute("SELECT asset_id FROM assets").fetchone()[0]
+                db.execute("UPDATE assets SET is_favorite=1, read_status='read', personal_note='保留我' WHERE asset_id=?", (asset_id,))
+                db.commit()
+
+            original.write_text("<html><title>Java 进阶</title><body>第二版正文，包含线程池。</body></html>", encoding="utf-8")
+            updated = synchronize(source, database)
+            self.assertEqual(updated["updated"], 1)
+
+            moved_path = source / "technology" / "renamed.html"
+            moved_path.parent.mkdir()
+            original.rename(moved_path)
+            moved = synchronize(source, database)
+            self.assertEqual(moved["moved"], 1)
+            with sqlite3.connect(database) as db:
+                row = db.execute("SELECT asset_id,is_favorite,read_status,personal_note,relative_path FROM assets").fetchone()
+            self.assertEqual(row, (asset_id, 1, "read", "保留我", "technology/renamed.html"))
+
+            moved_path.unlink()
+            missing = synchronize(source, database)
+            self.assertEqual(missing["newly_missing"], 1)
+            repository = ArchiveRepository(database)
+            self.assertEqual(repository.stats()["total"], 0)
+            self.assertEqual(repository.stats()["missing"], 1)
 
 
 if __name__ == "__main__":

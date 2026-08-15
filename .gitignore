@@ -9,3 +9,4 @@ data/user-overrides.json
 reports/inventory.jsonl
 reports/scan-errors.csv
 reports/classification-summary.md
+reports/incremental-scan-summary.json

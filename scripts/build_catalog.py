@@ -263,7 +263,9 @@ def create_schema(connection: sqlite3.Connection) -> None:
             tags_json TEXT NOT NULL,
             parse_status TEXT NOT NULL,
             error_message TEXT,
-            duplicate_group TEXT
+            duplicate_group TEXT,
+            file_status TEXT NOT NULL DEFAULT 'active',
+            file_mtime_ns INTEGER
         );
         CREATE INDEX idx_assets_sha256 ON assets(sha256);
         CREATE INDEX idx_assets_category ON assets(primary_category);
@@ -347,7 +349,13 @@ def scan(source: Path, output: Path) -> Dict[str, object]:
 
             json_out.write(json.dumps(record, ensure_ascii=False) + "\n")
             connection.execute("""
-                INSERT INTO assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO assets (
+                    asset_id, original_path, relative_path, file_name, extension, mime_type,
+                    size_bytes, sha256, title_raw, title_clean, source_url, source_domain,
+                    saved_at, saved_at_source, modified_at, encoding, asset_type,
+                    primary_category, tags_json, parse_status, error_message, duplicate_group,
+                    file_status, file_mtime_ns
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 record["asset_id"], record["original_path"], record["relative_path"], record["file_name"],
                 record["extension"], record["mime_type"], record["size_bytes"], record.get("sha256"),
@@ -356,6 +364,7 @@ def scan(source: Path, output: Path) -> Dict[str, object]:
                 record.get("modified_at"), record.get("encoding"), record["asset_type"],
                 record["primary_category"], json.dumps(record["tags"], ensure_ascii=False),
                 record["parse_status"], record.get("error_message"), record.get("duplicate_group"),
+                "active", stat.st_mtime_ns if record["parse_status"] == "success" else None,
             ))
             if index % 50 == 0:
                 connection.commit()

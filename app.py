@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = PROJECT_ROOT / "web"
 DEFAULT_DB = PROJECT_ROOT / "data" / "catalog.sqlite"
 CATEGORIES = ["technology", "ai", "career-work", "finance-business", "life", "society-culture", "productivity-tools", "uncategorized"]
-API_VERSION = 3
+API_VERSION = 4
 
 
 def connect(database: Path) -> sqlite3.Connection:
@@ -57,6 +57,8 @@ class ArchiveRepository:
                 "is_favorite": "INTEGER NOT NULL DEFAULT 0",
                 "read_status": "TEXT NOT NULL DEFAULT 'unread'",
                 "personal_note": "TEXT NOT NULL DEFAULT ''",
+                "file_status": "TEXT NOT NULL DEFAULT 'active'",
+                "file_mtime_ns": "INTEGER",
             }
             for name, definition in additions.items():
                 if name not in columns:
@@ -100,20 +102,22 @@ class ArchiveRepository:
 
     def stats(self) -> Dict[str, object]:
         with connect(self.database) as db:
-            total = db.execute("SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store'").fetchone()[0]
-            ignored = db.execute("SELECT COUNT(*) FROM assets WHERE file_name = '.DS_Store'").fetchone()[0]
-            indexed = db.execute("SELECT COUNT(*) FROM contents WHERE extraction_status='success'").fetchone()[0]
-            categories = {row[0]: row[1] for row in db.execute("SELECT primary_category, COUNT(*) FROM assets WHERE file_name != '.DS_Store' GROUP BY primary_category")}
-            types = {row[0]: row[1] for row in db.execute("SELECT asset_type, COUNT(*) FROM assets WHERE file_name != '.DS_Store' GROUP BY asset_type")}
-            review = db.execute("SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND classification_source='auto-v2'").fetchone()[0]
-            favorites = db.execute("SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND is_favorite=1").fetchone()[0]
-            read = db.execute("SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND read_status='read'").fetchone()[0]
-        return {"api_version": API_VERSION, "total": total, "ignored": ignored, "indexed": indexed, "review": review, "favorites": favorites, "read": read, "categories": categories, "types": types}
+            active = "file_status='active'"
+            total = db.execute(f"SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND {active}").fetchone()[0]
+            ignored = db.execute(f"SELECT COUNT(*) FROM assets WHERE file_name = '.DS_Store' AND {active}").fetchone()[0]
+            missing = db.execute("SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND file_status='missing'").fetchone()[0]
+            indexed = db.execute("SELECT COUNT(*) FROM contents c JOIN assets a USING(asset_id) WHERE c.extraction_status='success' AND a.file_status='active'").fetchone()[0]
+            categories = {row[0]: row[1] for row in db.execute(f"SELECT primary_category, COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND {active} GROUP BY primary_category")}
+            types = {row[0]: row[1] for row in db.execute(f"SELECT asset_type, COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND {active} GROUP BY asset_type")}
+            review = db.execute(f"SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND {active} AND classification_source='auto-v2'").fetchone()[0]
+            favorites = db.execute(f"SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND {active} AND is_favorite=1").fetchone()[0]
+            read = db.execute(f"SELECT COUNT(*) FROM assets WHERE file_name != '.DS_Store' AND {active} AND read_status='read'").fetchone()[0]
+        return {"api_version": API_VERSION, "total": total, "ignored": ignored, "missing": missing, "indexed": indexed, "review": review, "favorites": favorites, "read": read, "categories": categories, "types": types}
 
     def search(self, query: str = "", category: str = "", asset_type: str = "", state_filter: str = "", review: bool = False, page: int = 1, limit: int = 30) -> Dict[str, object]:
         page, limit = max(page, 1), max(1, min(limit, 100))
         params: List[object] = []
-        filters = ["a.file_name != '.DS_Store'"]
+        filters = ["a.file_name != '.DS_Store'", "a.file_status = 'active'"]
         if query.strip():
             source = "contents_fts JOIN assets a USING(asset_id)"
             filters.append("contents_fts MATCH ?")
