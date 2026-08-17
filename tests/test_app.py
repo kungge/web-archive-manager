@@ -8,7 +8,7 @@ import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
-from app import ArchiveRepository, AppHandler, CATEGORIES, API_VERSION, ThreadingHTTPServer
+from app import ArchiveRepository, AppHandler, APP_VERSION, CATEGORIES, API_VERSION, ThreadingHTTPServer, load_config
 from scripts.classify_catalog import score_asset
 from scripts.build_catalog import scan
 from scripts.build_search_index import build
@@ -135,7 +135,7 @@ class RepositoryTest(unittest.TestCase):
             backup = repository.create_backup()
             backup_dir = Path(backup["path"])
             self.assertTrue((backup_dir / "catalog.sqlite").is_file())
-            self.assertTrue((backup_dir / "user-overrides.json").is_file())
+            self.assertTrue((backup_dir / "overrides-bundle.json").is_file())
 
     def test_review_filter(self):
         result = ArchiveRepository(self.database).search(review=True, limit=5)
@@ -208,6 +208,10 @@ class RepositoryTest(unittest.TestCase):
                 self.assertIn("sandbox", response.headers["Content-Security-Policy"])
                 self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
                 response.read(32)
+            with urllib.request.urlopen(f"{base}/api/version") as response:
+                version = __import__("json").loads(response.read())
+                self.assertEqual(version["app_version"], APP_VERSION)
+                self.assertEqual(version["api_version"], API_VERSION)
             request = urllib.request.Request(f"{base}/api/assets/{html_asset['asset_id']}/open", method="POST", data=b"")
             with patch("app.open_local_file") as mocked_open:
                 with urllib.request.urlopen(request) as response:
@@ -234,6 +238,23 @@ class ClassifierTest(unittest.TestCase):
     def test_body_noise_does_not_force_category(self):
         category, _, _ = score_asset("article-viewed/example.mhtml", "如何学好英语", "历史 文化 电影 演员 新闻 教育")
         self.assertEqual(category, "uncategorized")
+
+
+class ConfigurationTest(unittest.TestCase):
+    def test_config_resolves_relative_paths_and_rejects_network_host(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text('{"database":"db/catalog.sqlite","port":8877,"log_file":"run/app.log"}', encoding="utf-8")
+            config = load_config(config_path)
+            self.assertEqual(config["port"], 8877)
+            self.assertEqual(config["database"], str((Path(temp_dir) / "db" / "catalog.sqlite").resolve()))
+            self.assertEqual(config["log_file"], str((Path(temp_dir) / "run" / "app.log").resolve()))
+            config_path.write_text('{"host":"0.0.0.0"}', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_config(config_path)
+            config_path.write_text('{"unknown":true}', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_config(config_path)
 
 
 class IncrementalScanTest(unittest.TestCase):

@@ -7,6 +7,8 @@ __pycache__/
 data/*.sqlite
 data/user-overrides.json
 data/backups/
+config.json
+logs/
 reports/inventory.jsonl
 reports/scan-errors.csv
 reports/classification-summary.md

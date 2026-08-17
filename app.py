@@ -4,6 +4,8 @@
 import argparse
 import datetime as dt
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import mimetypes
 import sqlite3
 import subprocess
@@ -20,8 +22,10 @@ from scripts.incremental_scan import synchronize
 PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = PROJECT_ROOT / "web"
 DEFAULT_DB = PROJECT_ROOT / "data" / "catalog.sqlite"
+DEFAULT_CONFIG = PROJECT_ROOT / "config.json"
+APP_VERSION = (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
 CATEGORIES = ["technology", "ai", "career-work", "finance-business", "life", "society-culture", "productivity-tools", "uncategorized"]
-API_VERSION = 8
+API_VERSION = 9
 DATA_BUNDLE_VERSION = 1
 SORT_OPTIONS = {
     "saved_desc": "a.saved_at DESC, a.asset_id",
@@ -39,6 +43,49 @@ def connect(database: Path) -> sqlite3.Connection:
 
 def normalize_query(value: str) -> str:
     return '"' + value.replace('"', '""').strip() + '"'
+
+
+def load_config(path: Path) -> Dict[str, object]:
+    defaults: Dict[str, object] = {
+        "database": str(DEFAULT_DB), "host": "127.0.0.1", "port": 8765,
+        "log_file": str(PROJECT_ROOT / "logs" / "app.log"),
+    }
+    if not path.is_file():
+        return defaults
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid config JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("config must be a JSON object")
+    unknown = set(value) - set(defaults)
+    if unknown:
+        raise ValueError(f"unknown config keys: {', '.join(sorted(unknown))}")
+    config = {**defaults, **value}
+    base = path.resolve().parent
+    for key in ("database", "log_file"):
+        candidate = Path(str(config[key])).expanduser()
+        config[key] = str(candidate if candidate.is_absolute() else (base / candidate).resolve())
+    if config["host"] not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("host must be a local loopback address")
+    if not isinstance(config["port"], int) or not 1 <= config["port"] <= 65535:
+        raise ValueError("port must be between 1 and 65535")
+    return config
+
+
+def setup_logging(log_file: Path) -> logging.Logger:
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("web_archive_manager")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    rotating = RotatingFileHandler(str(log_file), maxBytes=2 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    rotating.setFormatter(formatter)
+    logger.addHandler(console)
+    logger.addHandler(rotating)
+    return logger
 
 
 class ArchiveRepository:
@@ -189,7 +236,7 @@ class ArchiveRepository:
         database_backup = backup_dir / "catalog.sqlite"
         with connect(self.database) as source, sqlite3.connect(str(database_backup)) as target:
             source.backup(target)
-        bundle_path = backup_dir / "user-overrides.json"
+        bundle_path = backup_dir / "overrides-bundle.json"
         bundle_path.write_text(json.dumps(self.export_bundle(), ensure_ascii=False, indent=2), encoding="utf-8")
         return {"backup_id": stamp, "path": str(backup_dir), "database_bytes": database_backup.stat().st_size, "overrides": len(self.read_overrides())}
 
@@ -236,7 +283,7 @@ class ArchiveRepository:
                 GROUP BY tag.value ORDER BY COUNT(*) DESC, tag.value LIMIT 20
             """)]
         maintenance = {"duplicate_assets": duplicate_assets, "duplicate_groups": duplicate_groups, "parse_errors": parse_errors, "extraction_errors": extraction_errors, "missing": missing}
-        return {"api_version": API_VERSION, "total": total, "ignored": ignored, "missing": missing, "indexed": indexed, "review": review, "favorites": favorites, "read": read, "categories": categories, "types": types, "domains": domains, "tags": tags, "maintenance": maintenance}
+        return {"api_version": API_VERSION, "app_version": APP_VERSION, "total": total, "ignored": ignored, "missing": missing, "indexed": indexed, "review": review, "favorites": favorites, "read": read, "categories": categories, "types": types, "domains": domains, "tags": tags, "maintenance": maintenance}
 
     def search(self, query: str = "", category: str = "", asset_type: str = "", state_filter: str = "", review: bool = False, page: int = 1, limit: int = 30, domain: str = "", date_from: str = "", date_to: str = "", sort: str = "saved_desc", issue: str = "", tag: str = "") -> Dict[str, object]:
         page, limit = max(page, 1), max(1, min(limit, 100))
@@ -400,6 +447,10 @@ def reveal_local_file(path: Path) -> None:
 
 class AppHandler(BaseHTTPRequestHandler):
     repository: ArchiveRepository
+    logger = logging.getLogger("web_archive_manager")
+
+    def log_message(self, format: str, *args: object) -> None:
+        self.logger.info("%s - %s", self.address_string(), format % args)
 
     def json_response(self, value: object, status: int = 200) -> None:
         payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
@@ -427,6 +478,8 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/stats":
             return self.json_response(self.repository.stats())
+        if parsed.path == "/api/version":
+            return self.json_response({"app_version": APP_VERSION, "api_version": API_VERSION, "sqlite_version": sqlite3.sqlite_version})
         if parsed.path == "/api/data/export":
             return self.download_json(self.repository.export_bundle(), "web-archive-overrides.json")
         if parsed.path == "/api/health":
@@ -572,21 +625,48 @@ class AppHandler(BaseHTTPRequestHandler):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, default=DEFAULT_DB)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--database", type=Path)
+    parser.add_argument("--host")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--log-file", type=Path)
+    parser.add_argument("--check", action="store_true", help="run startup health check and exit")
     args = parser.parse_args()
-    if not args.database.is_file():
-        raise SystemExit(f"database not found: {args.database}")
-    AppHandler.repository = ArchiveRepository(args.database.resolve())
-    server = ThreadingHTTPServer((args.host, args.port), AppHandler)
-    print(f"Web Archive Manager: http://{args.host}:{args.port}")
+    try:
+        config = load_config(args.config.resolve())
+    except ValueError as exc:
+        raise SystemExit(f"config error: {exc}")
+    database = (args.database or Path(str(config["database"]))).resolve()
+    host = args.host or str(config["host"])
+    port = args.port if args.port is not None else int(config["port"])
+    log_file = (args.log_file or Path(str(config["log_file"]))).resolve()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise SystemExit("host must be a local loopback address")
+    if not 1 <= port <= 65535:
+        raise SystemExit("port must be between 1 and 65535")
+    if not database.is_file():
+        raise SystemExit(f"database not found: {database}")
+    logger = setup_logging(log_file)
+    AppHandler.logger = logger
+    AppHandler.repository = ArchiveRepository(database)
+    health = AppHandler.repository.health_report()
+    logger.info("startup health check: status=%s integrity=%s assets=%s fts=%s", health["status"], health["integrity_check"], health["assets"], health["fts_documents"])
+    if health["status"] != "healthy":
+        logger.error("startup health check needs attention: %s", json.dumps(health, ensure_ascii=False))
+        if not args.check:
+            raise SystemExit("startup health check failed; run python3 app.py --check for details")
+    if args.check:
+        print(json.dumps({"app_version": APP_VERSION, **health}, ensure_ascii=False, indent=2))
+        return 0 if health["status"] == "healthy" else 1
+    server = ThreadingHTTPServer((host, port), AppHandler)
+    logger.info("Web Archive Manager %s: http://%s:%s", APP_VERSION, host, port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+        logger.info("Web Archive Manager stopped")
     return 0
 
 

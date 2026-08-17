@@ -34,6 +34,7 @@
 | [02-整理规则与数据模型.md](./02-整理规则与数据模型.md) | 定义未来分类、标签、命名、唯一标识和安全边界 |
 | [03-实施计划与验收方案.md](./03-实施计划与验收方案.md) | 定义分阶段实施、试运行、回滚和验收方式 |
 | [04-工具需求草案.md](./04-工具需求草案.md) | 沉淀后续管理工具的范围、功能和技术方向 |
+| [05-运行与恢复指南.md](./05-运行与恢复指南.md) | 配置启动、健康检查、日志、备份和恢复步骤 |
 | [资产清单扫描报告](./reports/scan-summary.md) | 全量文件统计、格式、资产类型和初步分类结果 |
 | [全文索引构建报告](./reports/search-index-summary.md) | 正文抽取、全文索引结果与当前限制 |
 | 自动分类报告（本地生成） | `reports/classification-summary.md`，包含本地标题，不提交 Git |
@@ -56,6 +57,14 @@ python3 scripts/search_catalog.py 'Nacos' --category technology --limit 10
 cd /Users/wankun/github/my-project/web-archive-manager
 python3 app.py
 ```
+
+启动前只执行健康检查：
+
+```bash
+python3 app.py --check
+```
+
+如需修改数据库、端口或日志位置，复制 `config.example.json` 为不提交 Git 的 `config.json`。命令行的 `--database`、`--host`、`--port` 和 `--log-file` 会覆盖配置文件。
 
 更新代码后必须重启 Python 服务。只刷新浏览器会加载新前端，但不会重新加载正在运行的后端代码；页面会检测API版本并提示重启。
 
