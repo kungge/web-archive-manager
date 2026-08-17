@@ -63,3 +63,11 @@ python3 scripts/classify_catalog.py --apply
 ```bash
 python3 scripts/classify_catalog.py --confirm-all
 ```
+
+验证某个本地快照能否恢复（只使用系统临时目录，不覆盖当前数据）：
+
+```bash
+python3 scripts/verify_backup.py \
+  --backup data/backups/20260817T203143 \
+  --current data/catalog.sqlite
+```

@@ -1,4 +1,5 @@
 import unittest
+import json
 import tempfile
 import shutil
 import threading
@@ -13,6 +14,7 @@ from scripts.classify_catalog import score_asset
 from scripts.build_catalog import scan
 from scripts.build_search_index import build
 from scripts.incremental_scan import synchronize
+from scripts.verify_backup import verify_backup
 
 
 class RepositoryTest(unittest.TestCase):
@@ -136,6 +138,11 @@ class RepositoryTest(unittest.TestCase):
             backup_dir = Path(backup["path"])
             self.assertTrue((backup_dir / "catalog.sqlite").is_file())
             self.assertTrue((backup_dir / "overrides-bundle.json").is_file())
+            rehearsal = verify_backup(backup_dir, database)
+            self.assertEqual(rehearsal["status"], "healthy")
+            self.assertTrue(rehearsal["temporary_restore"])
+            self.assertTrue(rehearsal["bundle_imported"])
+            self.assertTrue(rehearsal["comparison"]["matches"])
 
     def test_review_filter(self):
         result = ArchiveRepository(self.database).search(review=True, limit=5)
@@ -209,9 +216,32 @@ class RepositoryTest(unittest.TestCase):
                 self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
                 response.read(32)
             with urllib.request.urlopen(f"{base}/api/version") as response:
-                version = __import__("json").loads(response.read())
+                version = json.loads(response.read())
                 self.assertEqual(version["app_version"], APP_VERSION)
                 self.assertEqual(version["api_version"], API_VERSION)
+            with urllib.request.urlopen(f"{base}/api/stats") as response:
+                stats = json.loads(response.read())
+                self.assertEqual(stats["api_version"], API_VERSION)
+                self.assertGreater(stats["total"], 0)
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+            with urllib.request.urlopen(f"{base}/api/health") as response:
+                self.assertEqual(json.loads(response.read())["status"], "healthy")
+            with urllib.request.urlopen(f"{base}/api/data/export") as response:
+                bundle = json.loads(response.read())
+                self.assertEqual(bundle["format"], "web-archive-manager-overrides")
+                self.assertIn("attachment", response.headers["Content-Disposition"])
+            with self.assertRaises(urllib.error.HTTPError) as invalid_search:
+                urllib.request.urlopen(f"{base}/api/search?sort=invalid")
+            self.assertEqual(invalid_search.exception.code, 400)
+            self.assertEqual(json.loads(invalid_search.exception.read())["error"], "未知的排序方式")
+            invalid_import = urllib.request.Request(
+                f"{base}/api/data/import", method="POST", data=b"{}",
+                headers={"Content-Type": "application/json"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as import_error:
+                urllib.request.urlopen(invalid_import)
+            self.assertEqual(import_error.exception.code, 400)
+            self.assertIn("不支持", json.loads(import_error.exception.read())["error"])
             request = urllib.request.Request(f"{base}/api/assets/{html_asset['asset_id']}/open", method="POST", data=b"")
             with patch("app.open_local_file") as mocked_open:
                 with urllib.request.urlopen(request) as response:
@@ -255,6 +285,18 @@ class ConfigurationTest(unittest.TestCase):
             config_path.write_text('{"unknown":true}', encoding="utf-8")
             with self.assertRaises(ValueError):
                 load_config(config_path)
+
+
+class FrontendContractTest(unittest.TestCase):
+    def test_accessibility_and_api_contract(self):
+        root = Path(__file__).resolve().parents[1]
+        html = (root / "web" / "index.html").read_text(encoding="utf-8")
+        javascript = (root / "web" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('class="skip-link" href="#resultsPanel"', html)
+        self.assertIn('aria-labelledby="assetTitle"', html)
+        self.assertIn("const requiredApiVersion=10", javascript)
+        self.assertIn('setAttribute("aria-pressed"', javascript)
+        self.assertIn("lastAssetTrigger.focus()", javascript)
 
 
 class IncrementalScanTest(unittest.TestCase):

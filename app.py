@@ -25,7 +25,7 @@ DEFAULT_DB = PROJECT_ROOT / "data" / "catalog.sqlite"
 DEFAULT_CONFIG = PROJECT_ROOT / "config.json"
 APP_VERSION = (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
 CATEGORIES = ["technology", "ai", "career-work", "finance-business", "life", "society-culture", "productivity-tools", "uncategorized"]
-API_VERSION = 9
+API_VERSION = 10
 DATA_BUNDLE_VERSION = 1
 SORT_OPTIONS = {
     "saved_desc": "a.saved_at DESC, a.asset_id",
@@ -55,21 +55,21 @@ def load_config(path: Path) -> Dict[str, object]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid config JSON: {exc}") from exc
+        raise ValueError(f"配置文件不是有效的 JSON：{exc}") from exc
     if not isinstance(value, dict):
-        raise ValueError("config must be a JSON object")
+        raise ValueError("配置文件顶层必须是 JSON 对象")
     unknown = set(value) - set(defaults)
     if unknown:
-        raise ValueError(f"unknown config keys: {', '.join(sorted(unknown))}")
+        raise ValueError(f"配置文件包含未知字段：{', '.join(sorted(unknown))}")
     config = {**defaults, **value}
     base = path.resolve().parent
     for key in ("database", "log_file"):
         candidate = Path(str(config[key])).expanduser()
         config[key] = str(candidate if candidate.is_absolute() else (base / candidate).resolve())
     if config["host"] not in {"127.0.0.1", "localhost", "::1"}:
-        raise ValueError("host must be a local loopback address")
+        raise ValueError("监听地址必须是本机回环地址")
     if not isinstance(config["port"], int) or not 1 <= config["port"] <= 65535:
-        raise ValueError("port must be between 1 and 65535")
+        raise ValueError("端口必须在 1 到 65535 之间")
     return config
 
 
@@ -102,7 +102,7 @@ class ArchiveRepository:
         with connect(self.database) as db:
             row = db.execute("SELECT value FROM metadata WHERE key='source_path'").fetchone()
         if not row:
-            raise ValueError("catalog metadata does not contain source_path")
+            raise ValueError("索引元数据中缺少 source_path")
         return Path(row[0]).resolve()
 
     def ensure_classification_columns(self) -> None:
@@ -179,9 +179,9 @@ class ArchiveRepository:
 
     def import_bundle(self, bundle: object) -> Dict[str, int]:
         if not isinstance(bundle, dict) or bundle.get("format") != "web-archive-manager-overrides":
-            raise ValueError("unsupported data bundle")
+            raise ValueError("不支持的人工数据包格式")
         if bundle.get("version") != DATA_BUNDLE_VERSION or not isinstance(bundle.get("overrides"), dict):
-            raise ValueError("unsupported data bundle version")
+            raise ValueError("不支持的人工数据包版本")
         with connect(self.database) as db:
             known_ids = {row[0] for row in db.execute("SELECT asset_id FROM assets")}
         validated: Dict[str, object] = {}
@@ -288,17 +288,17 @@ class ArchiveRepository:
     def search(self, query: str = "", category: str = "", asset_type: str = "", state_filter: str = "", review: bool = False, page: int = 1, limit: int = 30, domain: str = "", date_from: str = "", date_to: str = "", sort: str = "saved_desc", issue: str = "", tag: str = "") -> Dict[str, object]:
         page, limit = max(page, 1), max(1, min(limit, 100))
         if sort not in SORT_OPTIONS and sort != "relevance":
-            raise ValueError("unknown sort option")
+            raise ValueError("未知的排序方式")
         if issue not in {"", "duplicate", "parse_error", "extraction_error", "missing"}:
-            raise ValueError("unknown maintenance filter")
+            raise ValueError("未知的维护筛选条件")
         for value in (date_from, date_to):
             if value:
                 try:
                     __import__("datetime").date.fromisoformat(value)
                 except ValueError as exc:
-                    raise ValueError("date must use YYYY-MM-DD") from exc
+                    raise ValueError("日期必须使用 YYYY-MM-DD 格式") from exc
         if date_from and date_to and date_from > date_to:
-            raise ValueError("start date must not be later than end date")
+            raise ValueError("开始日期不能晚于结束日期")
         params: List[object] = []
         filters = ["a.file_name != '.DS_Store'", "a.file_status = 'missing'" if issue == "missing" else "a.file_status = 'active'"]
         if query.strip():
@@ -369,7 +369,7 @@ class ArchiveRepository:
 
     def run_incremental_scan(self) -> Dict[str, object]:
         if not self.scan_lock.acquire(blocking=False):
-            raise RuntimeError("incremental scan is already running")
+            raise RuntimeError("增量同步正在运行，请稍后再试")
         try:
             result = synchronize(self.archive_root, self.database)
             self.apply_overrides()
@@ -384,7 +384,7 @@ class ArchiveRepository:
                 raise KeyError(asset_id)
             category = category or current[0]
             if category not in CATEGORIES:
-                raise ValueError("unknown category")
+                raise ValueError("未知的主分类")
             normalized_tags = sorted({tag.strip() for tag in (tags if tags is not None else json.loads(current[1])) if tag.strip()})
             favorite_value = int(bool(is_favorite)) if is_favorite is not None else current[2]
             read_value = read_status if read_status is not None else current[3]
@@ -392,11 +392,11 @@ class ArchiveRepository:
             title_value = (title_clean if title_clean is not None else current[5] or "").strip()
             source_value = (source_url if source_url is not None else current[6] or "").strip() or None
             if read_value not in {"read", "unread"}:
-                raise ValueError("unknown read status")
+                raise ValueError("未知的阅读状态")
             if not title_value or len(title_value) > 1000:
-                raise ValueError("title must contain 1 to 1000 characters")
+                raise ValueError("标题长度必须为 1 到 1000 个字符")
             if source_value and urlparse(source_value).scheme not in {"http", "https"}:
-                raise ValueError("source URL must use http or https")
+                raise ValueError("原始网址必须使用 http 或 https")
             source_domain = urlparse(source_value).hostname if source_value else None
             db.execute("""
                 UPDATE assets SET primary_category=?, tags_json=?, classification_source='manual',
@@ -429,11 +429,11 @@ class ArchiveRepository:
             raise KeyError(asset_id)
         path = Path(row[0]).resolve()
         if self.archive_root != path and self.archive_root not in path.parents:
-            raise PermissionError("asset path is outside archive root")
+            raise PermissionError("档案路径不在归档根目录内")
         if not path.is_file():
             raise FileNotFoundError(path)
         if html_only and row[1].lower() not in {"html", "htm"}:
-            raise TypeError("only HTML files support safe preview")
+            raise TypeError("仅 HTML 文件支持安全预览")
         return path
 
 
@@ -503,7 +503,7 @@ class AppHandler(BaseHTTPRequestHandler):
             try:
                 return self.json_response(self.repository.get_asset(parsed.path.rsplit("/", 1)[-1]))
             except KeyError:
-                return self.error_response(404, "asset not found")
+                return self.error_response(404, "未找到该档案")
         if parsed.path.startswith("/preview/"):
             return self.serve_archive_preview(parsed.path.rsplit("/", 1)[-1])
         self.serve_static(parsed.path)
@@ -521,7 +521,7 @@ class AppHandler(BaseHTTPRequestHandler):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 if length <= 0 or length > 10 * 1024 * 1024:
-                    raise ValueError("import file must be between 1 byte and 10 MiB")
+                    raise ValueError("导入文件大小必须在 1 字节到 10 MiB 之间")
                 bundle = json.loads(self.rfile.read(length))
                 return self.json_response(self.repository.import_bundle(bundle))
             except (ValueError, json.JSONDecodeError) as exc:
@@ -538,31 +538,31 @@ class AppHandler(BaseHTTPRequestHandler):
                 reveal_local_file(path)
                 return self.json_response({"revealed": True, "asset_id": asset_id})
             except KeyError:
-                return self.error_response(404, "asset not found")
+                return self.error_response(404, "未找到该档案")
             except FileNotFoundError:
-                return self.error_response(410, "local file no longer exists")
+                return self.error_response(410, "本地原文件已不存在")
             except PermissionError as exc:
                 return self.error_response(403, str(exc))
         if not parsed.path.startswith("/api/assets/") or not parsed.path.endswith("/open"):
-            return self.error_response(404, "not found")
+            return self.error_response(404, "未找到请求的资源")
         asset_id = parsed.path.split("/")[-2]
         try:
             path = self.repository.get_local_file(asset_id)
             open_local_file(path)
             self.json_response({"opened": True, "asset_id": asset_id})
         except KeyError:
-            self.error_response(404, "asset not found")
+            self.error_response(404, "未找到该档案")
         except FileNotFoundError:
-            self.error_response(410, "local file no longer exists")
+            self.error_response(410, "本地原文件已不存在")
         except PermissionError as exc:
             self.error_response(403, str(exc))
         except OSError as exc:
-            self.error_response(500, f"failed to open local file: {exc}")
+            self.error_response(500, f"打开本地文件失败：{exc}")
 
     def do_PATCH(self) -> None:
         parsed = urlparse(self.path)
         if not parsed.path.startswith("/api/assets/"):
-            return self.error_response(404, "not found")
+            return self.error_response(404, "未找到请求的资源")
         try:
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
@@ -573,7 +573,7 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             self.json_response(result)
         except KeyError:
-            self.error_response(404, "asset not found")
+            self.error_response(404, "未找到该档案")
         except (ValueError, json.JSONDecodeError) as exc:
             self.error_response(400, str(exc))
 
@@ -581,7 +581,7 @@ class AppHandler(BaseHTTPRequestHandler):
         relative = "index.html" if request_path == "/" else request_path.lstrip("/")
         target = (STATIC_ROOT / relative).resolve()
         if STATIC_ROOT.resolve() not in target.parents or not target.is_file():
-            return self.error_response(404, "not found")
+            return self.error_response(404, "未找到请求的资源")
         payload = target.read_bytes()
         content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         if content_type.startswith("text/") or content_type == "application/javascript":
@@ -596,9 +596,9 @@ class AppHandler(BaseHTTPRequestHandler):
         try:
             path = self.repository.get_local_file(asset_id, html_only=True)
         except KeyError:
-            return self.error_response(404, "asset not found")
+            return self.error_response(404, "未找到该档案")
         except FileNotFoundError:
-            return self.error_response(410, "local file no longer exists")
+            return self.error_response(410, "本地原文件已不存在")
         except PermissionError as exc:
             return self.error_response(403, str(exc))
         except TypeError as exc:
@@ -635,17 +635,17 @@ def main() -> int:
     try:
         config = load_config(args.config.resolve())
     except ValueError as exc:
-        raise SystemExit(f"config error: {exc}")
+        raise SystemExit(f"配置错误：{exc}")
     database = (args.database or Path(str(config["database"]))).resolve()
     host = args.host or str(config["host"])
     port = args.port if args.port is not None else int(config["port"])
     log_file = (args.log_file or Path(str(config["log_file"]))).resolve()
     if host not in {"127.0.0.1", "localhost", "::1"}:
-        raise SystemExit("host must be a local loopback address")
+        raise SystemExit("监听地址必须是本机回环地址")
     if not 1 <= port <= 65535:
-        raise SystemExit("port must be between 1 and 65535")
+        raise SystemExit("端口必须在 1 到 65535 之间")
     if not database.is_file():
-        raise SystemExit(f"database not found: {database}")
+        raise SystemExit(f"未找到索引数据库：{database}")
     logger = setup_logging(log_file)
     AppHandler.logger = logger
     AppHandler.repository = ArchiveRepository(database)
@@ -654,7 +654,7 @@ def main() -> int:
     if health["status"] != "healthy":
         logger.error("startup health check needs attention: %s", json.dumps(health, ensure_ascii=False))
         if not args.check:
-            raise SystemExit("startup health check failed; run python3 app.py --check for details")
+            raise SystemExit("启动健康检查未通过；请运行 python3 app.py --check 查看详情")
     if args.check:
         print(json.dumps({"app_version": APP_VERSION, **health}, ensure_ascii=False, indent=2))
         return 0 if health["status"] == "healthy" else 1

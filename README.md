@@ -35,6 +35,7 @@
 | [03-实施计划与验收方案.md](./03-实施计划与验收方案.md) | 定义分阶段实施、试运行、回滚和验收方式 |
 | [04-工具需求草案.md](./04-工具需求草案.md) | 沉淀后续管理工具的范围、功能和技术方向 |
 | [05-运行与恢复指南.md](./05-运行与恢复指南.md) | 配置启动、健康检查、日志、备份和恢复步骤 |
+| [CHANGELOG.md](./CHANGELOG.md) | 稳定版本的功能与变更记录 |
 | [资产清单扫描报告](./reports/scan-summary.md) | 全量文件统计、格式、资产类型和初步分类结果 |
 | [全文索引构建报告](./reports/search-index-summary.md) | 正文抽取、全文索引结果与当前限制 |
 | 自动分类报告（本地生成） | `reports/classification-summary.md`，包含本地标题，不提交 Git |
@@ -95,6 +96,12 @@ python3 app.py --check
 - 生成健康报告：检查 SQLite 完整性、外键、孤立正文、全文索引数量和维护队列。
 
 `data/backups/` 仅保留在本机，不提交到 Git。
+
+创建快照后，可在系统临时目录中做一次完整恢复演练；该命令不会覆盖当前索引：
+
+```bash
+python3 scripts/verify_backup.py --backup data/backups/{backup_id} --current data/catalog.sqlite
+```
 
 ## 数据与 Git
 
