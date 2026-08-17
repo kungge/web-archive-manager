@@ -111,6 +111,32 @@ class RepositoryTest(unittest.TestCase):
             finally:
                 repository.scan_lock.release()
 
+    def test_export_import_backup_and_health_report(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "catalog.sqlite"
+            shutil.copy2(self.database, database)
+            repository = ArchiveRepository(database)
+            asset = repository.search(limit=1)["items"][0]
+            repository.update_asset(asset["asset_id"], "life", ["topic:portable"], True, "read", "可移植备注")
+            bundle = repository.export_bundle()
+            self.assertEqual(bundle["format"], "web-archive-manager-overrides")
+            self.assertIn(asset["asset_id"], bundle["overrides"])
+            bundle["overrides"]["unknown-asset"] = bundle["overrides"][asset["asset_id"]]
+            result = repository.import_bundle(bundle)
+            self.assertGreaterEqual(result["imported"], 1)
+            self.assertEqual(result["skipped"], 1)
+            restored = ArchiveRepository(database).get_asset(asset["asset_id"])
+            self.assertIn("topic:portable", restored["tags"])
+            with self.assertRaises(ValueError):
+                repository.import_bundle({"format": "other", "version": 1, "overrides": {}})
+            health = repository.health_report()
+            self.assertEqual(health["status"], "healthy")
+            self.assertEqual(health["integrity_check"], "ok")
+            backup = repository.create_backup()
+            backup_dir = Path(backup["path"])
+            self.assertTrue((backup_dir / "catalog.sqlite").is_file())
+            self.assertTrue((backup_dir / "user-overrides.json").is_file())
+
     def test_review_filter(self):
         result = ArchiveRepository(self.database).search(review=True, limit=5)
         self.assertTrue(all(item["classification_source"] == "auto-v2" for item in result["items"]))

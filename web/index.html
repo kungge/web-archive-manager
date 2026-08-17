@@ -37,6 +37,12 @@
             <div class="maintenance-title"><h2>维护抽屉</h2><span id="healthStamp">检查中</span></div>
             <div id="maintenanceFilters" class="maintenance-list"></div>
             <button id="runScan" class="scan-button"><span>同步归档</span><small>只更新索引，不改原件</small></button>
+            <div class="preservation-tools" aria-label="数据保全">
+              <div class="preservation-label">数据保全袋</div>
+              <button id="exportData">导出人工数据</button><button id="importData">导入并合并</button>
+              <button id="backupData">创建本地快照</button><button id="checkHealth">生成健康报告</button>
+              <input id="importFile" type="file" accept="application/json,.json" hidden>
+            </div>
           </div>
         </aside>
         <section class="results-panel">

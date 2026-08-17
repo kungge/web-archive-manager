@@ -2,6 +2,7 @@
 """Local web UI for browsing and classifying archived webpages."""
 
 import argparse
+import datetime as dt
 import json
 import mimetypes
 import sqlite3
@@ -20,7 +21,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = PROJECT_ROOT / "web"
 DEFAULT_DB = PROJECT_ROOT / "data" / "catalog.sqlite"
 CATEGORIES = ["technology", "ai", "career-work", "finance-business", "life", "society-culture", "productivity-tools", "uncategorized"]
-API_VERSION = 7
+API_VERSION = 8
+DATA_BUNDLE_VERSION = 1
 SORT_OPTIONS = {
     "saved_desc": "a.saved_at DESC, a.asset_id",
     "saved_asc": "a.saved_at ASC, a.asset_id",
@@ -78,7 +80,8 @@ class ArchiveRepository:
         if not self.override_path.is_file():
             return {}
         try:
-            return json.loads(self.override_path.read_text(encoding="utf-8"))
+            value = json.loads(self.override_path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
         except (json.JSONDecodeError, OSError):
             return {}
 
@@ -118,6 +121,93 @@ class ArchiveRepository:
             temp = self.override_path.with_suffix(".tmp")
             temp.write_text(json.dumps(overrides, ensure_ascii=False, indent=2), encoding="utf-8")
             temp.replace(self.override_path)
+
+    def export_bundle(self) -> Dict[str, object]:
+        return {
+            "format": "web-archive-manager-overrides",
+            "version": DATA_BUNDLE_VERSION,
+            "exported_at": dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds"),
+            "overrides": self.read_overrides(),
+        }
+
+    def import_bundle(self, bundle: object) -> Dict[str, int]:
+        if not isinstance(bundle, dict) or bundle.get("format") != "web-archive-manager-overrides":
+            raise ValueError("unsupported data bundle")
+        if bundle.get("version") != DATA_BUNDLE_VERSION or not isinstance(bundle.get("overrides"), dict):
+            raise ValueError("unsupported data bundle version")
+        with connect(self.database) as db:
+            known_ids = {row[0] for row in db.execute("SELECT asset_id FROM assets")}
+        validated: Dict[str, object] = {}
+        skipped = 0
+        for asset_id, value in bundle["overrides"].items():
+            if asset_id not in known_ids or not isinstance(value, dict):
+                skipped += 1
+                continue
+            category = value.get("primary_category")
+            tags = value.get("tags", [])
+            read_status = value.get("read_status", "unread")
+            title = value.get("title_clean")
+            source_url = value.get("source_url")
+            personal_note = value.get("personal_note", "")
+            if category not in CATEGORIES or read_status not in {"read", "unread"}:
+                skipped += 1
+                continue
+            if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
+                skipped += 1
+                continue
+            if not isinstance(personal_note, str):
+                skipped += 1
+                continue
+            if title is not None and (not isinstance(title, str) or not title.strip() or len(title.strip()) > 1000):
+                skipped += 1
+                continue
+            if source_url is not None and (not isinstance(source_url, str) or urlparse(source_url).scheme not in {"http", "https"}):
+                skipped += 1
+                continue
+            validated[asset_id] = {
+                "primary_category": category,
+                "tags": sorted({tag.strip() for tag in tags if tag.strip()}),
+                "is_favorite": bool(value.get("is_favorite", False)),
+                "read_status": read_status,
+                "personal_note": personal_note,
+                **({"title_clean": title.strip()} if title is not None else {}),
+                **({"source_url": source_url} if "source_url" in value else {}),
+            }
+        with self.override_lock:
+            merged = self.read_overrides()
+            merged.update(validated)
+            temp = self.override_path.with_suffix(".tmp")
+            temp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp.replace(self.override_path)
+        self.apply_overrides()
+        return {"imported": len(validated), "skipped": skipped, "total": len(merged)}
+
+    def create_backup(self) -> Dict[str, object]:
+        stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+        backup_dir = self.database.parent / "backups" / stamp
+        backup_dir.mkdir(parents=True, exist_ok=False)
+        database_backup = backup_dir / "catalog.sqlite"
+        with connect(self.database) as source, sqlite3.connect(str(database_backup)) as target:
+            source.backup(target)
+        bundle_path = backup_dir / "user-overrides.json"
+        bundle_path.write_text(json.dumps(self.export_bundle(), ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"backup_id": stamp, "path": str(backup_dir), "database_bytes": database_backup.stat().st_size, "overrides": len(self.read_overrides())}
+
+    def health_report(self) -> Dict[str, object]:
+        with connect(self.database) as db:
+            integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
+            foreign_key_errors = len(db.execute("PRAGMA foreign_key_check").fetchall())
+            assets = db.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+            indexed = db.execute("SELECT COUNT(*) FROM contents_fts").fetchone()[0]
+            orphan_contents = db.execute("SELECT COUNT(*) FROM contents c LEFT JOIN assets a USING(asset_id) WHERE a.asset_id IS NULL").fetchone()[0]
+        stats = self.stats()
+        return {
+            "generated_at": dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds"),
+            "status": "healthy" if integrity == "ok" and foreign_key_errors == 0 and orphan_contents == 0 else "attention",
+            "integrity_check": integrity, "foreign_key_errors": foreign_key_errors,
+            "assets": assets, "fts_documents": indexed, "orphan_contents": orphan_contents,
+            "maintenance": stats["maintenance"], "overrides": len(self.read_overrides()),
+        }
 
     def stats(self) -> Dict[str, object]:
         with connect(self.database) as db:
@@ -323,10 +413,24 @@ class AppHandler(BaseHTTPRequestHandler):
     def error_response(self, status: int, message: str) -> None:
         self.json_response({"error": message}, status)
 
+    def download_json(self, value: object, filename: str) -> None:
+        payload = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/stats":
             return self.json_response(self.repository.stats())
+        if parsed.path == "/api/data/export":
+            return self.download_json(self.repository.export_bundle(), "web-archive-overrides.json")
+        if parsed.path == "/api/health":
+            return self.json_response(self.repository.health_report())
         if parsed.path == "/api/search":
             params = parse_qs(parsed.query)
             try:
@@ -359,6 +463,20 @@ class AppHandler(BaseHTTPRequestHandler):
             except RuntimeError as exc:
                 return self.error_response(409, str(exc))
             except (OSError, sqlite3.Error, ValueError) as exc:
+                return self.error_response(500, str(exc))
+        if parsed.path == "/api/data/import":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 10 * 1024 * 1024:
+                    raise ValueError("import file must be between 1 byte and 10 MiB")
+                bundle = json.loads(self.rfile.read(length))
+                return self.json_response(self.repository.import_bundle(bundle))
+            except (ValueError, json.JSONDecodeError) as exc:
+                return self.error_response(400, str(exc))
+        if parsed.path == "/api/data/backup":
+            try:
+                return self.json_response(self.repository.create_backup())
+            except (OSError, sqlite3.Error) as exc:
                 return self.error_response(500, str(exc))
         if parsed.path.startswith("/api/assets/") and parsed.path.endswith("/reveal"):
             asset_id = parsed.path.split("/")[-2]
